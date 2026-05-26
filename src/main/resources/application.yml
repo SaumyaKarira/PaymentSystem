@@ -137,7 +137,7 @@ logging:
   level:
     root: INFO
     org.example: DEBUG
-    org.springframework.kafka: DEBUG
+    org.springframework.kafka: INFO
     org.hibernate.SQL: DEBUG
     org.hibernate.type.descriptor.sql: TRACE
 
