@@ -1,0 +1,153 @@
+##############################################################################
+# application.yml — Payment Orchestration System
+# All backing services are configured to run locally (localhost).
+# No environment variables are assumed; values are hard-coded for local dev.
+##############################################################################
+
+spring:
+  application:
+    name: payment-orchestration-system
+
+  # ─────────────────────────────────────────────────────────────────
+  # DATASOURCE — Local MySQL
+  # Prerequisites: MySQL running on localhost:3306
+  #   CREATE DATABASE payment_orchestrator;
+  #   (user=root, password=password)
+  # ─────────────────────────────────────────────────────────────────
+  datasource:
+    url: jdbc:mysql://localhost:3306/payment_orchestrator?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
+    username: root
+    password: password
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      # Maximum number of connections in the pool; sized for a dev machine
+      maximum-pool-size: 10
+      # Minimum number of idle connections kept alive
+      minimum-idle: 5
+      # Time (ms) a connection is allowed to sit idle before being retired
+      idle-timeout: 30000
+      # Maximum lifetime (ms) of a connection in the pool
+      max-lifetime: 1800000
+      # Time (ms) the client will wait for a connection from the pool
+      connection-timeout: 30000
+      pool-name: PaymentHikariPool
+
+  # ─────────────────────────────────────────────────────────────────
+  # JPA / HIBERNATE
+  # ─────────────────────────────────────────────────────────────────
+  jpa:
+    hibernate:
+      # validate: Hibernate validates schema against entities on startup.
+      # Use "create" first run if schema.sql is not executed manually.
+      ddl-auto: validate
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: true
+        # Enable Hibernate statistics for diagnosing N+1 queries in dev
+        generate_statistics: false
+    # Defer datasource initialization so schema.sql runs before Hibernate validation
+    defer-datasource-initialization: true
+
+  # ─────────────────────────────────────────────────────────────────
+  # SQL INITIALIZATION — runs schema.sql at startup (dev convenience)
+  # ─────────────────────────────────────────────────────────────────
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+
+  # ─────────────────────────────────────────────────────────────────
+  # REDIS — Local Redis instance on localhost:6379
+  # Prerequisites: Redis server running (`redis-server`)
+  # Used for: Idempotency key storage with 24-hour TTL
+  # ─────────────────────────────────────────────────────────────────
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      # No password set for local dev Redis
+      password:
+      # Database index 0 (default)
+      database: 0
+      lettuce:
+        pool:
+          # Maximum active connections in Lettuce connection pool
+          max-active: 8
+          # Maximum idle connections
+          max-idle: 8
+          # Minimum idle connections kept alive
+          min-idle: 2
+          # Maximum time (ms) to wait for a connection; -1 = wait indefinitely
+          max-wait: -1ms
+
+  # ─────────────────────────────────────────────────────────────────
+  # KAFKA — Local Apache Kafka broker on localhost:9092
+  # Prerequisites:
+  #   1. ZooKeeper running on localhost:2181  (or KRaft mode)
+  #   2. Kafka broker running on localhost:9092
+  # Topics are auto-created by Spring Kafka @RetryableTopic on first run.
+  # ─────────────────────────────────────────────────────────────────
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      # key-serializer: standard String serializer for message keys
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # value-serializer: JSON serializer so PaymentEvent POJOs are sent as JSON
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # Strongest durability guarantee: leader + all in-sync replicas must ack
+      acks: all
+      # Retry the Kafka send up to 3 times before surfacing the exception
+      retries: 3
+      properties:
+        # Allow Kafka to batch sends; improves throughput without hurting latency much
+        linger.ms: 5
+        # Exactly-once semantics (prevents duplicate records on producer retries)
+        enable.idempotence: true
+    consumer:
+      group-id: payment-retry-group
+      # Earliest: read from the beginning of a topic partition when no offset is committed.
+      # Critical for retry topics so we don't miss messages after a restart.
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # JsonDeserializer with trusted packages to prevent deserialization attacks
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "org.example.*"
+        # Disable auto-commit so Spring Kafka's AckMode controls offset commits.
+        # This ensures a message is NOT committed until it is fully processed
+        # (or handed off to a retry/DLT topic by @RetryableTopic).
+        enable.auto.commit: false
+      # Maximum records polled per batch — keep low for local dev observability
+      max-poll-records: 10
+
+# ─────────────────────────────────────────────────────────────────
+# SERVER
+# ─────────────────────────────────────────────────────────────────
+server:
+  port: 8080
+  servlet:
+    context-path: /
+
+# ─────────────────────────────────────────────────────────────────
+# LOGGING — verbose for local development
+# ─────────────────────────────────────────────────────────────────
+logging:
+  level:
+    root: INFO
+    org.example: DEBUG
+    org.springframework.kafka: DEBUG
+    org.hibernate.SQL: DEBUG
+    org.hibernate.type.descriptor.sql: TRACE
+
+# ─────────────────────────────────────────────────────────────────
+# APPLICATION-SPECIFIC PROPERTIES
+# ─────────────────────────────────────────────────────────────────
+payment:
+  idempotency:
+    # TTL for idempotency keys stored in Redis (24 hours in seconds)
+    ttl-seconds: 86400
+  kafka:
+    main-topic: payment-main-topic
+
