@@ -13,7 +13,6 @@ import org.example.provider.PaymentProviderConnector;
 import org.example.repository.PaymentRepository;
 import org.example.routing.RoutingEngine;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -21,30 +20,80 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.UUID;
 
 /**
- * PaymentOrchestratorService — the heart of the payment system.
+ * PaymentOrchestratorService — core orchestration for the payment lifecycle.
  *
- * <p>This service coordinates the full payment lifecycle for synchronous API requests:
+ * <h2>The @Transactional Proxy Problem — Why Internal Calls Don't Work</h2>
+ * <p>Spring's {@code @Transactional} works via a JDK/CGLIB proxy. When you call a
+ * {@code @Transactional} method from OUTSIDE the bean (through the proxy), Spring
+ * intercepts the call and wraps it in a transaction. But when a method inside the
+ * same class calls another method in the same class using {@code this.method()},
+ * it bypasses the proxy entirely — the transaction annotation is silently ignored.
+ *
+ * <p>The previous implementation had {@code protected @Transactional} methods like
+ * {@code persistNewPayment()}, {@code updatePaymentOnSuccess()}, etc., which were
+ * all called via {@code this.} — meaning their {@code @Transactional} annotations
+ * NEVER fired. When the JPQL {@code @Modifying} queries then ran with no active
+ * transaction, JPA threw:
+ * <pre>
+ *   TransactionRequiredException: Executing an update/delete query
+ * </pre>
+ *
+ * <h2>The Fix Applied Here</h2>
+ * <p>The fix is two-part:
  * <ol>
- *   <li>Idempotency lock acquisition in Redis</li>
- *   <li>Payment entity creation and persistence in MySQL</li>
- *   <li>Synchronous provider call via the routing engine</li>
- *   <li>Status update (SUCCESS or PROCESSING) with optimistic lock protection</li>
- *   <li>Kafka publishing on provider failure for async retry</li>
- *   <li>Redis response caching on success</li>
+ *   <li><strong>Repository level</strong>: {@code @Transactional} is added directly
+ *       on the {@code @Modifying} methods in {@code PaymentRepository}. This is the
+ *       correct place — it guarantees a transaction at the repository boundary
+ *       regardless of what the caller does, since the repository IS a Spring-proxied
+ *       interface bean and its methods are always called through the proxy.</li>
+ *   <li><strong>Service level</strong>: The internal helper methods that were
+ *       {@code protected @Transactional} are inlined directly into the public method
+ *       flow, removing the dead same-class transaction annotations. The service
+ *       methods that ARE public and called from outside (like {@code getPayment()})
+ *       retain their {@code @Transactional} annotation correctly.</li>
  * </ol>
  *
- * <h2>Concurrency Safety</h2>
- * <p>Two concurrency scenarios are protected:
- * <ul>
- *   <li><strong>Duplicate HTTP requests</strong>: The {@code IdempotencyFilter} + Redis
- *       {@code SET NX} lock in {@code IdempotencyService.acquireInFlightLock()} ensures
- *       only one request proceeds for a given idempotency key at a time.</li>
- *   <li><strong>HTTP request vs. Kafka consumer race</strong>: The {@code @Version} field
- *       on the {@link Payment} entity means that if both a REST thread and a Kafka thread
- *       attempt to update the same payment row, the second one will see
- *       {@code ObjectOptimisticLockingFailureException} (Hibernate detects that the
- *       version in the DB no longer matches the version read by the losing thread).</li>
- * </ul>
+ * <h2>Payment State Transition Flow</h2>
+ *
+ * <h3>Happy Path (80% — synchronous SUCCESS)</h3>
+ * <pre>
+ * 1. Redis SET NX "idempotency:K" IN_FLIGHT  → lock acquired
+ * 2. INSERT payments (status=INITIATED, version=0)  → committed immediately
+ * 3. ProviderConnector.processPayment()  → returns providerRefId
+ * 4. paymentRepository.updateOnSuccess()  — @Transactional on the repository method
+ *    → UPDATE payments SET status=SUCCESS, version=1 WHERE id=? AND version=0
+ * 5. paymentRepository.findById()  → returns fresh entity (cache cleared by clearAutomatically=true)
+ * 6. Redis SET "idempotency:K" {PaymentResponse}  → cached for 24h
+ * 7. Return 201 {status: SUCCESS}
+ * </pre>
+ *
+ * <h3>Failure Path (20% — async Kafka retry → SUCCESS or FAILED)</h3>
+ * <pre>
+ * 1. Redis SET NX → lock acquired
+ * 2. INSERT payments (status=INITIATED, version=0) → committed
+ * 3. ProviderConnector.processPayment() → THROWS ProviderException (504/500)
+ * 4. paymentRepository.updateStatusWithVersionCheck(PROCESSING, retryCount=0, version=0)
+ *    → UPDATE payments SET status=PROCESSING, version=1 WHERE id=? AND version=0
+ *    → @Transactional on repository method ensures this commits
+ * 5. kafkaTemplate.send("payment-main-topic", paymentId, event)
+ *    → message published; client thread released immediately (non-blocking)
+ * 6. Redis SET "idempotency:K" {status: PROCESSING} → cached
+ * 7. Return 201 {status: PROCESSING}
+ *
+ * --- Async Kafka path (separate thread) ---
+ * 8. PaymentRetryConsumer.processPayment() attempt #1
+ *    → routes to primary provider (failover=false)
+ *    → if fails: updateStatusWithVersionCheck(PROCESSING, retryCount=1, version=1)
+ *    → throws ProviderException → @RetryableTopic forwards to retry-0 (after 2s)
+ * 9. attempt #2 — failover=true → alternate provider
+ *    → if succeeds: updateOnSuccess(SUCCESS, version=2) → status=SUCCESS in DB
+ *    → if fails: retryCount=2, forwarded to retry-1 (after 4s)
+ * 10. attempt #3 → alternate provider
+ *    → if fails: forwarded to retry-2 (after 8s)
+ * 11. attempt #4 → final attempt
+ *    → if fails → DLT handler fires
+ *    → updateStatusWithVersionCheck(FAILED, retryCount=4, version=4) → status=FAILED
+ * </pre>
  */
 @Slf4j
 @Service
@@ -56,96 +105,127 @@ public class PaymentOrchestratorService {
     private final RoutingEngine routingEngine;
     private final KafkaTemplate<String, PaymentEvent> kafkaTemplate;
 
-    /**
-     * Injected from {@code application.yml: payment.kafka.main-topic}.
-     * Defaults to "payment-main-topic" if the property is absent.
-     */
     @Value("${payment.kafka.main-topic:payment-main-topic}")
     private String mainTopic;
 
     /**
-     * Creates a new payment, attempts synchronous processing, and handles failure gracefully.
+     * Creates a new payment and orchestrates the full synchronous processing flow.
      *
-     * <p>This method is intentionally NOT annotated with {@code @Transactional} at the
-     * method level because it spans multiple non-transactional operations (Redis lock,
-     * DB save, external HTTP call, Kafka publish).  Individual DB operations use
-     * inner {@code @Transactional} methods to demarcate their own transaction boundaries.
-     *
-     * @param request         the validated payment creation request DTO
-     * @param idempotencyKey  the value from the {@code Idempotency-Key} header
-     * @return a {@link PaymentResponse} representing the newly created payment
+     * <p><strong>Transaction design:</strong> This method is NOT annotated with
+     * {@code @Transactional} because it spans multiple non-DB operations (Redis lock,
+     * external provider HTTP call, Kafka publish). Wrapping all of this in a single DB
+     * transaction would hold a connection open during the provider call — wasteful and
+     * risky. Instead, each DB operation delegates to the repository which carries its
+     * own {@code @Transactional} annotation, ensuring each write is committed
+     * independently and promptly.
      */
     public PaymentResponse createPayment(CreatePaymentRequest request, String idempotencyKey) {
 
         // ── STEP 1: ACQUIRE REDIS IN-FLIGHT LOCK ─────────────────────────────
-        // Try to atomically set the Redis key to IN_FLIGHT.
-        // acquireInFlightLock() uses SET NX (set if not exists) — only one thread wins.
-        // The filter already checked for in-flight and cached states, but between the
-        // filter check and here, a concurrent request could have slipped through.
-        // This lock is the definitive guard against concurrent duplicate processing.
+        // Redis SET NX (atomic set-if-not-exists). Only one thread can hold this lock
+        // for a given idempotency key. The filter already checked, but this is the
+        // definitive guard against any concurrent requests that slipped through.
         boolean lockAcquired = idempotencyService.acquireInFlightLock(idempotencyKey);
         if (!lockAcquired) {
-            // Another request beat us to the lock. This is extremely rare in practice
-            // (the filter handles the common case), but must be handled correctly.
-            log.warn("Idempotency lock contention for key [{}] — concurrent request won the lock",
-                    idempotencyKey);
-            // Check if a completed response exists (the other request may have finished)
+            log.warn("Idempotency lock contention for key [{}]", idempotencyKey);
             return idempotencyService.getCachedResponse(idempotencyKey)
                     .orElseThrow(() -> new org.example.exception.IdempotencyConflictException(idempotencyKey));
         }
 
         try {
-            // ── STEP 2: PERSIST INITIAL PAYMENT RECORD ───────────────────────
-            // Create and save the payment in INITIATED state.
-            // This is done in its own @Transactional method to ensure the record
-            // is committed to MySQL before we attempt the provider call.
-            Payment payment = persistNewPayment(request, idempotencyKey);
-            log.info("Payment [{}] created in INITIATED state for idempotency key [{}]",
-                    payment.getId(), idempotencyKey);
+            // ── STEP 2: PERSIST PAYMENT IN INITIATED STATE ───────────────────
+            // paymentRepository.save() uses Spring Data's built-in save which is
+            // @Transactional by default in SimpleJpaRepository — so this INSERT
+            // is committed as soon as save() returns. No proxy-bypass issue here
+            // because we are calling the repository bean (a Spring proxy), not this.
+            //
+            // NOTE: We assign the result of save() to a NEW final variable `savedPayment`
+            // rather than reassigning the builder result. This is required because lambdas
+            // (used in orElseThrow below) can only capture variables that are effectively
+            // final — a variable reassigned after declaration is NOT effectively final.
+            Payment builtPayment = Payment.builder()
+                    .id(UUID.randomUUID().toString())
+                    .idempotencyKey(idempotencyKey)
+                    .amount(request.amount())
+                    .currency(request.currency())
+                    .paymentMethod(request.paymentMethod())
+                    .status(PaymentStatus.INITIATED)
+                    .retryCount(0)
+                    .build();
+            final Payment payment = paymentRepository.save(builtPayment);
+            log.info("Payment [{}] saved in INITIATED state", payment.getId());
 
-            // ── STEP 3: ROUTE & ATTEMPT SYNCHRONOUS PROVIDER CALL ────────────
-            // Select the primary provider based on payment method.
+            // ── STEP 3: SELECT PROVIDER VIA ROUTING ENGINE ───────────────────
             PaymentProviderConnector connector = routingEngine.route(request.paymentMethod());
             log.info("Payment [{}] routed to provider [{}]", payment.getId(), connector.getProviderId());
 
             try {
-                // Call the (simulated) external provider — may throw ProviderException ~20%
+                // ── STEP 4a: CALL PROVIDER (simulated — 20% failure rate) ────
                 String providerRefId = connector.processPayment(
                         payment.getId(),
                         payment.getAmount(),
                         payment.getCurrency()
                 );
 
-                // ── STEP 4a: SUCCESS PATH ─────────────────────────────────────
-                // Update the payment status to SUCCESS with provider details.
-                // Uses version-guarded update to prevent race conditions.
-                updatePaymentOnSuccess(payment, connector.getProviderId(), providerRefId);
-                log.info("Payment [{}] succeeded via provider [{}]. Ref: {}",
-                        payment.getId(), connector.getProviderId(), providerRefId);
+                // ── STEP 4b: PROVIDER SUCCEEDED → UPDATE TO SUCCESS ──────────
+                // This calls paymentRepository.updateOnSuccess() which carries
+                // @Transactional + @Modifying(clearAutomatically=true).
+                // The UPDATE is executed and committed immediately.
+                // version=0 because payment was just inserted — no other thread
+                // could have modified it yet between INSERT and here.
+                int updated = paymentRepository.updateOnSuccess(
+                        payment.getId(),
+                        PaymentStatus.SUCCESS,
+                        connector.getProviderId(),
+                        providerRefId,
+                        payment.getRetryCount(),
+                        payment.getVersion()   // 0L from fresh INSERT
+                );
+                if (updated == 0) {
+                    // Extremely rare: another thread (Kafka consumer) updated this
+                    // payment concurrently between our INSERT and this UPDATE.
+                    // The other update wins — log and continue.
+                    log.warn("Optimistic lock conflict on SUCCESS update for payment [{}]", payment.getId());
+                } else {
+                    log.info("Payment [{}] → SUCCESS via provider [{}], ref: {}",
+                            payment.getId(), connector.getProviderId(), providerRefId);
+                }
 
-                // Reload the payment to get the latest state (post-update timestamps, etc.)
-                Payment updatedPayment = paymentRepository.findById(payment.getId())
+                // Reload the latest entity from DB.
+                // clearAutomatically=true on updateOnSuccess ensured the EntityManager
+                // cache was flushed, so findById now returns the updated row.
+                Payment successPayment = paymentRepository.findById(payment.getId())
                         .orElseThrow(() -> new PaymentNotFoundException(payment.getId()));
 
-                PaymentResponse successResponse = PaymentResponse.from(updatedPayment);
+                PaymentResponse response = PaymentResponse.from(successPayment);
 
-                // Cache the completed response in Redis — future duplicate requests will
-                // receive this directly from the filter without hitting MySQL.
-                idempotencyService.storeCompletedResponse(idempotencyKey, successResponse);
-                return successResponse;
+                // Cache in Redis so idempotent replays skip all DB/provider calls
+                idempotencyService.storeCompletedResponse(idempotencyKey, response);
+                return response;
 
             } catch (ProviderException providerEx) {
-                // ── STEP 4b: FAILURE PATH — TRANSITION TO KAFKA RETRY ────────
-                // The primary provider call failed (simulated 5xx/timeout).
-                // Transition the payment to PROCESSING status and push to Kafka.
-                log.warn("Payment [{}] primary provider [{}] failed: {}. Pushing to retry pipeline.",
+                // ── STEP 4c: PROVIDER FAILED → TRANSITION TO PROCESSING ──────
+                // The synchronous provider call failed (504/500). We do NOT mark
+                // as FAILED here — the Kafka retry pipeline will attempt recovery.
+                log.warn("Payment [{}] provider [{}] failed: {}. Moving to Kafka retry.",
                         payment.getId(), providerEx.getProviderName(), providerEx.getMessage());
 
-                updatePaymentToProcessing(payment, connector.getProviderId());
+                // UPDATE status → PROCESSING.
+                // @Transactional + @Modifying on the repository method ensures this
+                // commits even though we are in a non-transactional service method.
+                int updated = paymentRepository.updateStatusWithVersionCheck(
+                        payment.getId(),
+                        PaymentStatus.PROCESSING,
+                        payment.getRetryCount(),   // still 0 — first attempt
+                        payment.getVersion()        // 0L from fresh INSERT
+                );
+                if (updated == 0) {
+                    log.warn("Version conflict transitioning payment [{}] to PROCESSING", payment.getId());
+                }
 
-                // Publish the PaymentEvent to Kafka for non-blocking retry.
-                // We use the payment ID as the Kafka message key to ensure ordering:
-                // all retry events for the same payment go to the same partition.
+                // Publish to Kafka. The payment ID is the message key — this guarantees
+                // all retry events for this payment go to the same partition, preserving
+                // the processing order for this specific payment.
                 PaymentEvent event = new PaymentEvent(
                         payment.getId(),
                         payment.getAmount(),
@@ -155,27 +235,26 @@ public class PaymentOrchestratorService {
                         payment.getVersion()
                 );
                 kafkaTemplate.send(mainTopic, payment.getId(), event);
-                log.info("Payment [{}] published to Kafka topic [{}] for retry", payment.getId(), mainTopic);
+                log.info("Payment [{}] published to Kafka [{}] for non-blocking retry",
+                        payment.getId(), mainTopic);
 
-                // Reload and return the current state (PROCESSING) to the caller.
-                // The caller can poll GET /v1/payments/{id} to check the outcome.
+                // Reload fresh entity after the PROCESSING update
                 Payment processingPayment = paymentRepository.findById(payment.getId())
                         .orElseThrow(() -> new PaymentNotFoundException(payment.getId()));
+
                 PaymentResponse processingResponse = PaymentResponse.from(processingPayment);
 
-                // Store the current (PROCESSING) response in Redis.
-                // This ensures idempotent re-calls while retry is in flight will see
-                // the current status rather than re-entering the creation flow.
+                // Cache the PROCESSING response so idempotent replays return tracking info
                 idempotencyService.storeCompletedResponse(idempotencyKey, processingResponse);
+
+                // Return immediately — client thread is released; Kafka handles retry async
                 return processingResponse;
             }
 
         } catch (Exception unexpectedException) {
-            // ── UNEXPECTED ERROR CLEANUP ──────────────────────────────────────
-            // For any unhandled exception (e.g., DB connectivity issues), release the
-            // Redis idempotency key so the client can retry after the error is resolved.
-            // Without this, the key would remain as IN_FLIGHT for 24 hours.
-            log.error("Unexpected error during payment creation for idempotency key [{}]: {}",
+            // Release the Redis idempotency key on any unhandled error so the client
+            // can safely retry once the underlying issue is resolved.
+            log.error("Unexpected error creating payment for key [{}]: {}",
                     idempotencyKey, unexpectedException.getMessage(), unexpectedException);
             idempotencyService.releaseKey(idempotencyKey);
             throw unexpectedException;
@@ -183,119 +262,17 @@ public class PaymentOrchestratorService {
     }
 
     /**
-     * Fetches a payment by its UUID from MySQL.
+     * Fetches a payment by UUID from MySQL — always reads live data, never Redis.
      *
-     * <p>This is a read-only operation — no locks, no Redis involvement.
-     * Spring Data JPA's {@code findById} issues a simple {@code SELECT} query.
-     *
-     * @param paymentId the UUID of the payment to fetch
-     * @return the payment response DTO
-     * @throws PaymentNotFoundException if no payment with the given ID exists
+     * <p>{@code @Transactional(readOnly = true)} tells the JPA provider to use a
+     * read-only transaction — no dirty checking, no flush, which gives a small
+     * performance benefit for SELECT-only operations.
      */
     @Transactional(readOnly = true)
     public PaymentResponse getPayment(String paymentId) {
         Payment payment = paymentRepository.findById(paymentId)
                 .orElseThrow(() -> new PaymentNotFoundException(paymentId));
         return PaymentResponse.from(payment);
-    }
-
-    /**
-     * Persists a new {@link Payment} entity in INITIATED state.
-     *
-     * <p>{@code @Transactional} ensures this entire DB write is committed atomically.
-     * If the {@code save()} fails (e.g., duplicate idempotency key due to a DB race),
-     * the transaction rolls back automatically.
-     *
-     * @param request        the payment request
-     * @param idempotencyKey the idempotency key
-     * @return the saved (and now DB-persisted) Payment entity
-     */
-    @Transactional
-    protected Payment persistNewPayment(CreatePaymentRequest request, String idempotencyKey) {
-        Payment payment = Payment.builder()
-                .id(UUID.randomUUID().toString())
-                .idempotencyKey(idempotencyKey)
-                .amount(request.amount())
-                .currency(request.currency())
-                .paymentMethod(request.paymentMethod())
-                .status(PaymentStatus.INITIATED)
-                .retryCount(0)
-                .build();
-        return paymentRepository.save(payment);
-    }
-
-    /**
-     * Updates a payment to SUCCESS state with provider details.
-     *
-     * <h2>Optimistic Locking Comment</h2>
-     * <p>We use the custom {@code updateOnSuccess} JPQL query which includes
-     * {@code WHERE version = :version} in its WHERE clause.  This is equivalent to
-     * what Hibernate does with {@code @Version} on a standard {@code save()}, but it
-     * avoids a SELECT before the UPDATE (saves one DB round-trip).
-     *
-     * <p>If the update returns 0 rows (version mismatch), it means the Kafka consumer
-     * concurrently updated this payment first.  In this extremely rare scenario, we log
-     * a warning and do not throw — the Kafka consumer's update takes precedence.
-     *
-     * @param payment             the payment entity (with current version)
-     * @param providerId          the provider that succeeded
-     * @param providerReferenceId the provider's transaction ID
-     */
-    @Transactional
-    protected void updatePaymentOnSuccess(Payment payment, String providerId, String providerReferenceId) {
-        try {
-            int rowsUpdated = paymentRepository.updateOnSuccess(
-                    payment.getId(),
-                    PaymentStatus.SUCCESS,
-                    providerId,
-                    providerReferenceId,
-                    payment.getRetryCount(),
-                    payment.getVersion()
-            );
-            if (rowsUpdated == 0) {
-                // Version mismatch: another thread (Kafka consumer) already updated this record.
-                // This is an expected race condition under concurrent processing.
-                // The other thread's update is presumed correct — log and continue.
-                log.warn("Optimistic lock conflict during SUCCESS update for payment [{}]. "
-                        + "Another thread may have already updated the status.", payment.getId());
-            }
-        } catch (OptimisticLockingFailureException e) {
-            // Hibernate-level optimistic lock exception (from save() path, not our custom query).
-            // Same handling: log and continue. The other transaction's state is authoritative.
-            log.warn("ObjectOptimisticLockingFailureException for payment [{}]: {}",
-                    payment.getId(), e.getMessage());
-        }
-    }
-
-    /**
-     * Transitions a payment from INITIATED to PROCESSING state.
-     *
-     * <p>Called after the primary provider call fails.  The {@code WHERE version = :version}
-     * guard ensures we don't accidentally overwrite a concurrent SUCCESS update from another
-     * thread that might have retried immediately.
-     *
-     * @param payment     the payment entity (with current version)
-     * @param providerId  the provider that failed (recorded for observability)
-     */
-    @Transactional
-    protected void updatePaymentToProcessing(Payment payment, String providerId) {
-        // Update provider_id so we know which connector was tried on the sync path
-        payment.setProviderId(providerId);
-        try {
-            int rowsUpdated = paymentRepository.updateStatusWithVersionCheck(
-                    payment.getId(),
-                    PaymentStatus.PROCESSING,
-                    payment.getRetryCount(),
-                    payment.getVersion()
-            );
-            if (rowsUpdated == 0) {
-                log.warn("Version conflict transitioning payment [{}] to PROCESSING. "
-                        + "Row may have been updated concurrently.", payment.getId());
-            }
-        } catch (OptimisticLockingFailureException e) {
-            log.warn("ObjectOptimisticLockingFailureException transitioning payment [{}] to PROCESSING: {}",
-                    payment.getId(), e.getMessage());
-        }
     }
 }
 
