@@ -1,16 +1,14 @@
 package org.example.filter;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.dto.PaymentResponse;
-import org.example.exception.IdempotencyConflictException;
 import org.example.service.IdempotencyService;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
@@ -59,7 +57,6 @@ import java.util.Optional;
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class IdempotencyFilter extends OncePerRequestFilter {
 
     /** HTTP header name expected from clients */
@@ -71,11 +68,19 @@ public class IdempotencyFilter extends OncePerRequestFilter {
     private final IdempotencyService idempotencyService;
 
     /**
-     * ObjectMapper instance for writing error/cached responses back to the HTTP response.
-     * Initialized inline to avoid a circular bean dependency with the main Spring context.
+     * Injected from RedisConfig — the same ObjectMapper used by IdempotencyService
+     * to serialize PaymentResponse. Using the SAME bean instance guarantees that the
+     * format written to Redis (by the service) matches the format read back here (by
+     * the filter) — dates as ISO-8601 strings, no @class type metadata.
      */
-    private final ObjectMapper objectMapper = new ObjectMapper()
-            .registerModule(new JavaTimeModule());
+    private final ObjectMapper objectMapper;
+
+    public IdempotencyFilter(
+            IdempotencyService idempotencyService,
+            @Qualifier("redisObjectMapper") ObjectMapper objectMapper) {
+        this.idempotencyService = idempotencyService;
+        this.objectMapper = objectMapper;
+    }
 
     /**
      * Core filter logic.
