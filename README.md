@@ -7,23 +7,17 @@ A event-driven **Payment Orchestration System** built with **Java 21** and **Spr
 ## Table of Contents
 
 - [What This Project Does](#what-this-project-does)
+- [System Architecture Blueprint](#system-architecture-blueprint)
 - [Technology Stack](#technology-stack)
-- [Project Structure](#project-structure)
 - [Infrastructure Setup (Localhost)](#infrastructure-setup-localhost)
 - [Execution & Quick-Start Guide](#execution--quick-start-guide)
 - [Testing Idempotency & Payment Routing](#testing-idempotency--payment-routing)
-- [System Architecture Blueprint](#system-architecture-blueprint)
-- [API Reference](#api-reference)
-   - [Create Payment](#create-payment)
-   - [Get Payment](#get-payment)
+- [Create Payment](#create-payment)
+- [Get Payment](#get-payment)
 - [Payment Lifecycle & State Machine](#payment-lifecycle--state-machine)
 - [Idempotency Behaviour](#idempotency-behaviour)
 - [Kafka Retry & DLQ Architecture](#kafka-retry--dlq-architecture)
 - [Provider Routing & Retry Strategy](#provider-routing--retry-strategy)
-- [Concurrency & Optimistic Locking](#concurrency--optimistic-locking)
-- [Running Tests](#running-tests)
-- [Sample cURL Commands](#sample-curl-commands)
-- [Monitoring & Debugging](#monitoring--debugging)
 
 ---
 
@@ -195,66 +189,6 @@ Async Kafka Retry Phase (separate thread):
 | Build Tool       | Maven                             | 3.8+       |
 | Boilerplate      | Lombok                            | Latest     |
 | Testing          | JUnit 5, Mockito, AssertJ, Awaitility, EmbeddedKafka | — |
-
----
-
-## Project Structure
-
-```
-PaymentSystem/
-├── pom.xml
-├── README.md
-└── src/
-    ├── main/
-    │   ├── java/org/example/
-    │   │   ├── PaymentOrchestrationApplication.java                         # Spring Boot entry point
-    │   │   ├── config/
-    │   │   │   ├── RedisConfig.java              # Lettuce Redis configuration
-    │   │   │   ├── KafkaProducerConfig.java      # Kafka producer beans
-    │   │   │   └── KafkaConsumerConfig.java      # Kafka consumer + @EnableRetryableTopic
-    │   │   ├── controller/
-    │   │   │   └── PaymentController.java        # REST endpoints
-    │   │   ├── dto/
-    │   │   │   ├── CreatePaymentRequest.java     # Inbound request DTO (record)
-    │   │   │   ├── PaymentResponse.java          # Outbound response DTO (record)
-    │   │   │   ├── PaymentEvent.java             # Kafka message payload (record)
-    │   │   │   └── ErrorResponse.java            # Standardised error payload (record)
-    │   │   ├── entity/
-    │   │   │   ├── Payment.java                  # JPA entity with @Version
-    │   │   │   ├── PaymentMethod.java            # Enum: CARD, UPI
-    │   │   │   └── PaymentStatus.java            # Enum: INITIATED, PROCESSING, SUCCESS, FAILED
-    │   │   ├── exception/
-    │   │   │   ├── GlobalExceptionHandler.java   # @RestControllerAdvice
-    │   │   │   ├── PaymentNotFoundException.java
-    │   │   │   ├── IdempotencyConflictException.java
-    │   │   │   └── ProviderException.java
-    │   │   ├── filter/
-    │   │   │   └── IdempotencyFilter.java        # OncePerRequestFilter for idempotency
-    │   │   ├── kafka/
-    │   │   │   └── PaymentRetryConsumer.java     # @RetryableTopic + @DltHandler
-    │   │   ├── provider/
-    │   │   │   ├── PaymentProviderConnector.java # Interface
-    │   │   │   ├── ProviderAConnector.java       # CARD primary (20% simulated failure)
-    │   │   │   └── ProviderBConnector.java       # UPI primary / CARD failover
-    │   │   ├── repository/
-    │   │   │   └── PaymentRepository.java        # Spring Data JPA + custom JPQL
-    │   │   ├── routing/
-    │   │   │   └── RoutingEngine.java            # Payment method → provider selection
-    │   │   └── service/
-    │   │       ├── IdempotencyService.java       # Redis lock + cache logic
-    │   │       └── PaymentOrchestratorService.java # Core orchestration
-    │   └── resources/
-    │       ├── application.yml                   # All config (MySQL, Redis, Kafka)
-    │       └── schema.sql                        # MySQL DDL (auto-run on startup)
-    └── test/
-        └── java/org/example/
-            ├── service/
-            │   └── PaymentOrchestratorServiceTest.java  # Mockito unit tests
-            ├── filter/
-            │   └── IdempotencyFilterTest.java           # @WebMvcTest slice tests
-            └── kafka/
-                └── PaymentConsumerIntegrationTest.java  # @EmbeddedKafka integration tests
-```
 
 ---
 
@@ -660,30 +594,3 @@ All attempts target the same provider (ProviderA for CARD, ProviderB for UPI).
 
 ---
 
-
-
-
-
-### Test Coverage Summary
-
-| Test File | Type | Tests | What It Validates |
-|-----------|------|-------|-------------------|
-| `PaymentOrchestratorServiceTest` | Mockito Unit | 11 | Routing logic, sync/async state transitions, Kafka hand-off, DLT handler, optimistic lock warnings |
-| `IdempotencyFilterTest` | `@WebMvcTest` Slice | 10 | Filter HTTP short-circuits (400/409), cache hits (201), Bean Validation, GlobalExceptionHandler (404) |
-| `PaymentConsumerIntegrationTest` | `@EmbeddedKafka` Integration | 5 | Full Kafka retry lifecycle, failover routing, DLT terminal state, idempotent skip of terminal payments |
-
-## Configuration Reference
-
-All configuration is in `src/main/resources/application.yml`. Key properties:
-
-| Property | Default | Description |
-|----------|---------|-------------|
-| `spring.datasource.url` | `jdbc:mysql://localhost:3306/payment_orchestrator` | MySQL connection URL |
-| `spring.datasource.username` | `root` | MySQL username |
-| `spring.datasource.password` | `password` | MySQL password |
-| `spring.data.redis.host` | `localhost` | Redis host |
-| `spring.data.redis.port` | `6379` | Redis port |
-| `spring.kafka.bootstrap-servers` | `localhost:9092` | Kafka broker address |
-| `payment.idempotency.ttl-seconds` | `86400` | Redis key TTL (24 hours) |
-| `payment.kafka.main-topic` | `payment-main-topic` | Main Kafka topic name |
-| `server.port` | `8080` | HTTP server port |
