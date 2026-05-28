@@ -14,6 +14,7 @@ import org.example.service.IdempotencyService;
 import org.example.service.PaymentOrchestratorService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
@@ -43,24 +44,36 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * IdempotencyFilterTest — web slice tests for IdempotencyFilter.
+ * IdempotencyFilterTest — web-slice tests for {@link IdempotencyFilter}.
  *
- * <h2>Architecture</h2>
- * <p>This test class validates the IdempotencyFilter behavior using @WebMvcTest
- * to load only the web layer with explicit component imports.
+ * <h2>Why @WebMvcTest(controllers = PaymentController.class)</h2>
+ * <p>{@code @WebMvcTest} starts only the Spring MVC layer — no JPA, no Redis, no Kafka.
+ * Providing {@code controllers = PaymentController.class} explicitly tells Spring which
+ * {@code @RestController} to register with the DispatcherServlet. This is the key step
+ * that binds the route {@code /v1/payments} so it is recognized as a controller endpoint
+ * rather than a phantom static-resource path. Without it (or without the controller being
+ * picked up by component scan), any request to {@code /v1/payments} falls through to
+ * Spring's default static-resource handler and throws {@code NoResourceFoundException}.
  *
- * <h2>Why @WebMvcTest with explicit @Import</h2>
- * <p>@WebMvcTest starts only the web layer. We explicitly import:
+ * <h2>Why @Import({IdempotencyFilter.class, GlobalExceptionHandler.class, ...})</h2>
+ * <p>{@code @WebMvcTest} does NOT auto-scan {@code @Component} beans outside the narrow
+ * web layer. We must explicitly import:
  * <ul>
- *   <li>{@code IdempotencyFilter} — the component under test</li>
- *   <li>{@code GlobalExceptionHandler} — handles exceptions from the controller</li>
- *   <li>{@code TestRedisObjectMapperConfig} — provides the {@code redisObjectMapper} bean</li>
+ *   <li>{@link IdempotencyFilter} — the Servlet filter under test. Importing it as a bean
+ *       causes Spring Boot's test infrastructure to register it in the MockMvc filter chain
+ *       automatically, because it extends {@code OncePerRequestFilter}.</li>
+ *   <li>{@link GlobalExceptionHandler} — the {@code @RestControllerAdvice} that maps
+ *       exceptions thrown by the controller to structured JSON error responses. Without this,
+ *       exceptions bubble up as raw 500s with no JSON body.</li>
+ *   <li>{@code TestRedisObjectMapperConfig} — provides the {@code @Qualifier("redisObjectMapper")}
+ *       bean that {@link IdempotencyFilter}'s constructor requires. Without this, the
+ *       application context fails to start with a {@code NoSuchBeanDefinitionException}.</li>
  * </ul>
  *
- * <h2>Mock Setup</h2>
- * <p>Services are mocked with @MockBean to isolate filter behavior from
- * database and cache implementations. Mocks are reset between test groups
- * to prevent state pollution.
+ * <h2>Why @MockBean for services</h2>
+ * <p>{@code @MockBean} replaces real beans in the application context with Mockito mocks,
+ * preventing any attempt to connect to Redis, MySQL, or Kafka. The filter and controller
+ * are the only real beans in this slice; every other collaborator is a test double.
  */
 @WebMvcTest(controllers = PaymentController.class)
 @Import({
@@ -71,11 +84,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @DisplayName("IdempotencyFilter — Web Slice Tests")
 class IdempotencyFilterTest {
 
+    // =========================================================================
+    // Inner configuration — provides the redisObjectMapper bean
+    // =========================================================================
+
     /**
-     * Provides the redisObjectMapper bean required by IdempotencyFilter.
-     * In production this bean comes from RedisConfig, but @WebMvcTest
-     * doesn't load RedisConfig. This minimal config provides only what
-     * the filter needs to serialize cached PaymentResponse objects.
+     * Minimal {@code @Configuration} supplying the {@code redisObjectMapper} bean
+     * required by {@link IdempotencyFilter}'s constructor.
+     *
+     * <p>In production this bean lives in {@code RedisConfig}. Since {@code @WebMvcTest}
+     * does not load infrastructure configuration classes, we provide a test-local
+     * replacement that is imported via {@code @Import} at the class level.
      */
     @Configuration
     static class TestRedisObjectMapperConfig {
@@ -106,20 +125,20 @@ class IdempotencyFilterTest {
     private static final String IDEM_HEADER     = "Idempotency-Key";
     private static final String PAYMENT_ID      = "550e8400-e29b-41d4-a716-446655440001";
     private static final String IDEMPOTENCY_KEY = "unique-key-for-test-001";
+    private static final String PROVIDER_A_ID   = "PROVIDER_A";
+    private static final String PROVIDER_A_REF  = "PROVA-CACHEDREF12345";
 
     @BeforeEach
     void setUp() {
-        // Initialize ObjectMapper for deserialization in tests
         objectMapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-
-        // Reset mocks before each test to prevent cross-test pollution
+        // Reset all mock state before each test to prevent cross-test pollution.
         reset(idempotencyService, paymentOrchestratorService);
     }
 
     // =========================================================================
-    // Test Helpers
+    // Helpers
     // =========================================================================
 
     private String validCardBody() {
@@ -132,7 +151,7 @@ class IdempotencyFilterTest {
         return new PaymentResponse(
                 PAYMENT_ID, IDEMPOTENCY_KEY, new BigDecimal("150.00"), "USD",
                 PaymentMethod.CARD, PaymentStatus.SUCCESS,
-                "PROVIDER_A", "PROVA-CACHEDREF12345", 0,
+                PROVIDER_A_ID, PROVIDER_A_REF, 0,
                 LocalDateTime.now().minusMinutes(2), LocalDateTime.now().minusMinutes(2));
     }
 
@@ -140,196 +159,281 @@ class IdempotencyFilterTest {
     // CATEGORY A — Filter pass-through (valid requests reach the controller)
     // =========================================================================
 
-    @Test
-    @DisplayName("TC-01: Valid POST with new Idempotency-Key passes filter → HTTP 201 Created")
-    void validPostPassesThroughFilter() throws Exception {
-        when(idempotencyService.isInFlight(IDEMPOTENCY_KEY)).thenReturn(false);
-        when(idempotencyService.getCachedResponse(IDEMPOTENCY_KEY)).thenReturn(Optional.empty());
-        when(paymentOrchestratorService.createPayment(any(CreatePaymentRequest.class), anyString()))
-                .thenReturn(cachedSuccessResponse());
+    @Nested
+    @DisplayName("Category A — Filter Pass-Through Scenarios")
+    class FilterPassThroughTests {
 
-        mockMvc.perform(post(PAYMENTS_URL)
-                        .header(IDEM_HEADER, IDEMPOTENCY_KEY)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(validCardBody()))
-                .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.status").value("SUCCESS"))
-                .andExpect(jsonPath("$.id").value(PAYMENT_ID));
+        /**
+         * TC-01: A valid POST with a fresh Idempotency-Key (not in-flight, not cached)
+         * must pass all filter checks, reach the controller, and return HTTP 201.
+         */
+        @Test
+        @DisplayName("TC-01: Valid POST with new Idempotency-Key passes filter → HTTP 201 Created")
+        void validPostPassesThroughFilter() throws Exception {
+            when(idempotencyService.isInFlight(IDEMPOTENCY_KEY)).thenReturn(false);
+            when(idempotencyService.getCachedResponse(IDEMPOTENCY_KEY)).thenReturn(Optional.empty());
+            when(paymentOrchestratorService.createPayment(any(CreatePaymentRequest.class), anyString()))
+                    .thenReturn(cachedSuccessResponse());
 
-        verify(idempotencyService).isInFlight(IDEMPOTENCY_KEY);
-        verify(idempotencyService).getCachedResponse(IDEMPOTENCY_KEY);
-        verify(paymentOrchestratorService).createPayment(any(), any());
-    }
+            mockMvc.perform(post(PAYMENTS_URL)
+                            .header(IDEM_HEADER, IDEMPOTENCY_KEY)
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(validCardBody()))
+                    .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.status").value("SUCCESS"))
+                    .andExpect(jsonPath("$.id").value(PAYMENT_ID))
+                    .andExpect(jsonPath("$.paymentMethod").value("CARD"));
 
-    @Test
-    @DisplayName("TC-02: GET requests bypass IdempotencyFilter — no idempotency checks performed")
-    void getRequestsBypassFilter() throws Exception {
-        when(paymentOrchestratorService.getPayment(PAYMENT_ID))
-                .thenReturn(cachedSuccessResponse());
+            verify(idempotencyService).isInFlight(IDEMPOTENCY_KEY);
+            verify(idempotencyService).getCachedResponse(IDEMPOTENCY_KEY);
+            verify(paymentOrchestratorService).createPayment(any(), anyString());
+        }
 
-        mockMvc.perform(get(PAYMENTS_URL + "/" + PAYMENT_ID))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.id").value(PAYMENT_ID));
+        /**
+         * TC-02: GET requests must bypass IdempotencyFilter — the filter's scope check
+         * ({@code !"POST".equalsIgnoreCase(method)}) passes them through immediately.
+         */
+        @Test
+        @DisplayName("TC-02: GET requests bypass IdempotencyFilter — no idempotency checks performed")
+        void getRequestsBypassFilter() throws Exception {
+            when(paymentOrchestratorService.getPayment(PAYMENT_ID))
+                    .thenReturn(cachedSuccessResponse());
 
-        // Verify idempotency checks were NOT performed for GET request
-        verify(idempotencyService, never()).isInFlight(anyString());
-        verify(idempotencyService, never()).getCachedResponse(anyString());
+            mockMvc.perform(get(PAYMENTS_URL + "/" + PAYMENT_ID))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.id").value(PAYMENT_ID));
+
+            verify(idempotencyService, never()).isInFlight(anyString());
+            verify(idempotencyService, never()).getCachedResponse(anyString());
+        }
     }
 
     // =========================================================================
     // CATEGORY B — Filter short-circuits (rejected requests)
     // =========================================================================
 
-    @Test
-    @DisplayName("TC-03A: Missing Idempotency-Key header → HTTP 400 Bad Request")
-    void missingIdempotencyKeyHeader_returns400() throws Exception {
-        mockMvc.perform(post(PAYMENTS_URL)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(validCardBody()))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.message", containsString("Idempotency-Key")));
+    @Nested
+    @DisplayName("Category B — Filter Rejection Scenarios")
+    class FilterRejectionTests {
 
-        verify(paymentOrchestratorService, never())
-                .createPayment(any(CreatePaymentRequest.class), anyString());
-    }
+        /**
+         * TC-03A: Missing Idempotency-Key header — filter writes 400 directly and
+         * never calls the filter chain, so the controller is never reached.
+         */
+        @Test
+        @DisplayName("TC-03A: Missing Idempotency-Key header → HTTP 400 Bad Request")
+        void missingIdempotencyKeyHeader_returns400() throws Exception {
+            mockMvc.perform(post(PAYMENTS_URL)
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(validCardBody()))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.message", containsString("Idempotency-Key")));
 
-    @Test
-    @DisplayName("TC-03B: Blank Idempotency-Key header → HTTP 400 Bad Request")
-    void blankIdempotencyKeyHeader_returns400() throws Exception {
-        mockMvc.perform(post(PAYMENTS_URL)
-                        .header(IDEM_HEADER, "   ")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(validCardBody()))
-                .andExpect(status().isBadRequest());
+            verify(paymentOrchestratorService, never())
+                    .createPayment(any(CreatePaymentRequest.class), anyString());
+        }
 
-        verify(paymentOrchestratorService, never())
-                .createPayment(any(CreatePaymentRequest.class), anyString());
-    }
+        /**
+         * TC-03B: Whitespace-only Idempotency-Key — {@code isBlank()} returns true,
+         * filter rejects with 400 before reaching the controller.
+         */
+        @Test
+        @DisplayName("TC-03B: Blank Idempotency-Key header → HTTP 400 Bad Request")
+        void blankIdempotencyKeyHeader_returns400() throws Exception {
+            mockMvc.perform(post(PAYMENTS_URL)
+                            .header(IDEM_HEADER, "   ")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(validCardBody()))
+                    .andExpect(status().isBadRequest());
 
-    @Test
-    @DisplayName("TC-03C: Negative amount fails Bean Validation → HTTP 400 with fieldErrors")
-    void negativeAmount_returns400WithFieldErrors() throws Exception {
-        String body = """
-                {"amount": -50.00, "currency": "USD", "paymentMethod": "CARD"}
-                """;
+            verify(paymentOrchestratorService, never())
+                    .createPayment(any(CreatePaymentRequest.class), anyString());
+        }
 
-        mockMvc.perform(post(PAYMENTS_URL)
-                        .header(IDEM_HEADER, "valid-key-bad-body")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.fieldErrors").isArray());
+        /**
+         * TC-03C: Header is valid so the filter passes the request through, but a
+         * negative amount fails {@code @Valid} Bean Validation in the controller.
+         * {@code GlobalExceptionHandler} returns 400 with a {@code fieldErrors} array.
+         */
+        @Test
+        @DisplayName("TC-03C: Negative amount fails Bean Validation → HTTP 400 with fieldErrors")
+        void negativeAmount_returns400WithFieldErrors() throws Exception {
+            // The filter passes — stub it to let the request through
+            when(idempotencyService.isInFlight("valid-key-bad-body")).thenReturn(false);
+            when(idempotencyService.getCachedResponse("valid-key-bad-body")).thenReturn(Optional.empty());
 
-        verify(paymentOrchestratorService, never())
-                .createPayment(any(CreatePaymentRequest.class), anyString());
-    }
+            String body = """
+                    {"amount": -50.00, "currency": "USD", "paymentMethod": "CARD"}
+                    """;
 
-    @Test
-    @DisplayName("TC-03D: Invalid paymentMethod enum → HTTP 400 Bad Request")
-    void invalidPaymentMethodEnum_returns400() throws Exception {
-        String body = """
-                {"amount": 100.00, "currency": "USD", "paymentMethod": "WIRE"}
-                """;
+            mockMvc.perform(post(PAYMENTS_URL)
+                            .header(IDEM_HEADER, "valid-key-bad-body")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(body))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.fieldErrors").isArray());
 
-        mockMvc.perform(post(PAYMENTS_URL)
-                        .header(IDEM_HEADER, "valid-key-enum-test")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isBadRequest());
+            verify(paymentOrchestratorService, never())
+                    .createPayment(any(CreatePaymentRequest.class), anyString());
+        }
 
-        verify(paymentOrchestratorService, never())
-                .createPayment(any(CreatePaymentRequest.class), anyString());
-    }
+        /**
+         * TC-03D: Invalid enum value for {@code paymentMethod} causes
+         * {@code HttpMessageNotReadableException} during JSON deserialization.
+         * Mapped to 400 by {@code GlobalExceptionHandler.handleMalformedBody()}.
+         */
+        @Test
+        @DisplayName("TC-03D: Invalid paymentMethod enum value → HTTP 400 Bad Request")
+        void invalidPaymentMethodEnum_returns400() throws Exception {
+            when(idempotencyService.isInFlight("valid-key-enum-test")).thenReturn(false);
+            when(idempotencyService.getCachedResponse("valid-key-enum-test")).thenReturn(Optional.empty());
 
-    @Test
-    @DisplayName("TC-03E: Null currency fails Bean Validation → HTTP 400 with currency field error")
-    void nullCurrency_returns400WithCurrencyFieldError() throws Exception {
-        String body = """
-                {"amount": 100.00, "paymentMethod": "CARD"}
-                """;
+            String body = """
+                    {"amount": 100.00, "currency": "USD", "paymentMethod": "WIRE"}
+                    """;
 
-        mockMvc.perform(post(PAYMENTS_URL)
-                        .header(IDEM_HEADER, "valid-key-no-currency")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.fieldErrors").isArray())
-                .andExpect(jsonPath("$.fieldErrors[?(@.field == 'currency')]").exists());
+            mockMvc.perform(post(PAYMENTS_URL)
+                            .header(IDEM_HEADER, "valid-key-enum-test")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(body))
+                    .andExpect(status().isBadRequest());
 
-        verify(paymentOrchestratorService, never())
-                .createPayment(any(CreatePaymentRequest.class), anyString());
-    }
+            verify(paymentOrchestratorService, never())
+                    .createPayment(any(CreatePaymentRequest.class), anyString());
+        }
 
-    @Test
-    @DisplayName("TC-05: In-flight Idempotency-Key → HTTP 409 Conflict, controller not reached")
-    void inFlightKey_returns409Conflict() throws Exception {
-        when(idempotencyService.isInFlight(IDEMPOTENCY_KEY)).thenReturn(true);
+        /**
+         * TC-03E: Missing {@code currency} field fails Bean Validation. The
+         * {@code fieldErrors} array must contain an entry for the {@code currency} field.
+         */
+        @Test
+        @DisplayName("TC-03E: Null currency fails Bean Validation → HTTP 400 with currency field error")
+        void nullCurrency_returns400WithCurrencyFieldError() throws Exception {
+            when(idempotencyService.isInFlight("valid-key-no-currency")).thenReturn(false);
+            when(idempotencyService.getCachedResponse("valid-key-no-currency")).thenReturn(Optional.empty());
 
-        mockMvc.perform(post(PAYMENTS_URL)
-                        .header(IDEM_HEADER, IDEMPOTENCY_KEY)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(validCardBody()))
-                .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.message", containsString(IDEMPOTENCY_KEY)));
+            String body = """
+                    {"amount": 100.00, "paymentMethod": "CARD"}
+                    """;
 
-        verify(paymentOrchestratorService, never())
-                .createPayment(any(CreatePaymentRequest.class), anyString());
-        verify(idempotencyService, never()).getCachedResponse(anyString());
-    }
+            mockMvc.perform(post(PAYMENTS_URL)
+                            .header(IDEM_HEADER, "valid-key-no-currency")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(body))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.fieldErrors").isArray())
+                    .andExpect(jsonPath("$.fieldErrors[?(@.field == 'currency')]").exists());
 
-    @Test
-    @DisplayName("TC-04: Cache hit in Redis → HTTP 200 OK with cached body, controller bypassed")
-    void cacheHit_returns200WithCachedBody() throws Exception {
-        when(idempotencyService.isInFlight(IDEMPOTENCY_KEY)).thenReturn(false);
-        when(idempotencyService.getCachedResponse(IDEMPOTENCY_KEY))
-                .thenReturn(Optional.of(cachedSuccessResponse()));
+            verify(paymentOrchestratorService, never())
+                    .createPayment(any(CreatePaymentRequest.class), anyString());
+        }
 
-        MvcResult result = mockMvc.perform(post(PAYMENTS_URL)
-                        .header(IDEM_HEADER, IDEMPOTENCY_KEY)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(validCardBody()))
-                .andExpect(status().isOk())
-                .andReturn();
+        /**
+         * TC-05: In-flight Idempotency-Key → HTTP 409 Conflict, controller not reached.
+         *
+         * <p>When {@code isInFlight(key)} returns {@code true}, the filter writes a 409
+         * directly to the response and returns without calling {@code filterChain.doFilter()}.
+         * Therefore the controller and {@code getCachedResponse()} are never invoked.
+         */
+        @Test
+        @DisplayName("TC-05: In-flight Idempotency-Key → HTTP 409 Conflict, controller not reached")
+        void inFlightKey_returns409Conflict() throws Exception {
+            when(idempotencyService.isInFlight(IDEMPOTENCY_KEY)).thenReturn(true);
 
-        PaymentResponse returned = objectMapper.readValue(
-                result.getResponse().getContentAsString(), PaymentResponse.class);
+            mockMvc.perform(post(PAYMENTS_URL)
+                            .header(IDEM_HEADER, IDEMPOTENCY_KEY)
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(validCardBody()))
+                    .andExpect(status().isConflict())
+                    .andExpect(jsonPath("$.message", containsString(IDEMPOTENCY_KEY)));
 
-        assertThat(returned.id()).isEqualTo(PAYMENT_ID);
-        assertThat(returned.status()).isEqualTo(PaymentStatus.SUCCESS);
-        assertThat(returned.providerReferenceId()).isEqualTo("PROVA-CACHEDREF12345");
+            // Controller must NOT have been reached
+            verify(paymentOrchestratorService, never())
+                    .createPayment(any(CreatePaymentRequest.class), anyString());
+            // getCachedResponse must NOT be called — in-flight check short-circuits first
+            verify(idempotencyService, never()).getCachedResponse(anyString());
+        }
 
-        // Verify controller was never called for cache hit
-        verify(paymentOrchestratorService, never())
-                .createPayment(any(CreatePaymentRequest.class), anyString());
+        /**
+         * TC-04: Redis cache hit → HTTP 200 OK with cached body, controller bypassed.
+         *
+         * <p>When {@code getCachedResponse(key)} returns a non-empty Optional, the filter
+         * serializes the {@link PaymentResponse} directly to the HTTP response (status 200)
+         * and returns without calling {@code filterChain.doFilter()}. The controller is
+         * never invoked — no new payment is created.
+         */
+        @Test
+        @DisplayName("TC-04: Redis cache hit → HTTP 200 with cached body, controller bypassed")
+        void cacheHit_returns200WithCachedBody() throws Exception {
+            when(idempotencyService.isInFlight(IDEMPOTENCY_KEY)).thenReturn(false);
+            when(idempotencyService.getCachedResponse(IDEMPOTENCY_KEY))
+                    .thenReturn(Optional.of(cachedSuccessResponse()));
+
+            MvcResult result = mockMvc.perform(post(PAYMENTS_URL)
+                            .header(IDEM_HEADER, IDEMPOTENCY_KEY)
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(validCardBody()))
+                    .andExpect(status().isOk())
+                    .andReturn();
+
+            PaymentResponse returned = objectMapper.readValue(
+                    result.getResponse().getContentAsString(), PaymentResponse.class);
+
+            assertThat(returned.id()).isEqualTo(PAYMENT_ID);
+            assertThat(returned.status()).isEqualTo(PaymentStatus.SUCCESS);
+            assertThat(returned.paymentMethod()).isEqualTo(PaymentMethod.CARD);
+            assertThat(returned.amount()).isEqualByComparingTo(new BigDecimal("150.00"));
+            assertThat(returned.currency()).isEqualTo("USD");
+            assertThat(returned.providerId()).isEqualTo(PROVIDER_A_ID);
+            assertThat(returned.providerReferenceId()).isEqualTo(PROVIDER_A_REF);
+            assertThat(returned.retryCount()).isEqualTo(0);
+
+            // Controller must NOT have been reached — filter short-circuited on cache hit
+            verify(paymentOrchestratorService, never())
+                    .createPayment(any(CreatePaymentRequest.class), anyString());
+        }
     }
 
     // =========================================================================
     // CATEGORY C — GlobalExceptionHandler error mapping
     // =========================================================================
 
-    @Test
-    @DisplayName("TC-08: GET with unknown payment ID → HTTP 404 structured response")
-    void unknownPaymentId_returns404() throws Exception {
-        String unknownId = "00000000-ffff-0000-ffff-000000000000";
-        when(paymentOrchestratorService.getPayment(unknownId))
-                .thenThrow(new PaymentNotFoundException(unknownId));
+    @Nested
+    @DisplayName("Category C — GlobalExceptionHandler Error Mapping")
+    class GlobalExceptionHandlerTests {
 
-        mockMvc.perform(get(PAYMENTS_URL + "/" + unknownId))
-                .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.status").value(404))
-                .andExpect(jsonPath("$.error").value("Not Found"))
-                .andExpect(jsonPath("$.message", containsString(unknownId)));
-    }
+        /**
+         * TC-08: GET with an unknown payment ID — service throws
+         * {@link PaymentNotFoundException}, mapped to HTTP 404 with a structured body.
+         */
+        @Test
+        @DisplayName("TC-08: GET with unknown payment ID → HTTP 404 structured response")
+        void unknownPaymentId_returns404() throws Exception {
+            String unknownId = "00000000-ffff-0000-ffff-000000000000";
+            when(paymentOrchestratorService.getPayment(unknownId))
+                    .thenThrow(new PaymentNotFoundException(unknownId));
 
-    @Test
-    @DisplayName("TC-09: Error response timestamp is an ISO-8601 string")
-    void errorResponseTimestamp_isIso8601String() throws Exception {
-        when(paymentOrchestratorService.getPayment(anyString()))
-                .thenThrow(new PaymentNotFoundException("any-id"));
+            mockMvc.perform(get(PAYMENTS_URL + "/" + unknownId))
+                    .andExpect(status().isNotFound())
+                    .andExpect(jsonPath("$.status").value(404))
+                    .andExpect(jsonPath("$.error").value("Not Found"))
+                    .andExpect(jsonPath("$.message", containsString(unknownId)));
+        }
 
-        mockMvc.perform(get(PAYMENTS_URL + "/any-id"))
-                .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.timestamp").isString());
+        /**
+         * TC-09: Error response {@code timestamp} must be an ISO-8601 string — not a
+         * numeric array — validating that {@code JavaTimeModule} is active in the context.
+         */
+        @Test
+        @DisplayName("TC-09: Error response timestamp is an ISO-8601 string")
+        void errorResponseTimestamp_isIso8601String() throws Exception {
+            when(paymentOrchestratorService.getPayment(anyString()))
+                    .thenThrow(new PaymentNotFoundException("any-id"));
+
+            mockMvc.perform(get(PAYMENTS_URL + "/any-id"))
+                    .andExpect(status().isNotFound())
+                    .andExpect(jsonPath("$.timestamp").isString());
+        }
     }
 }
 

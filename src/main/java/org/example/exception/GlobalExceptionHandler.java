@@ -11,6 +11,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -250,6 +251,26 @@ public class GlobalExceptionHandler {
     // ─────────────────────────────────────────────────────────────────────────
     // 500 INTERNAL SERVER ERROR — Unexpected / unhandled errors
     // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Handles {@code NoResourceFoundException} — thrown by Spring MVC when a request
+     * targets a static resource path that does not exist (e.g., {@code /favicon.ico}
+     * automatically requested by browsers).
+     *
+     * <p>This is intentionally logged at DEBUG level and suppressed from ERROR logs
+     * because it is a benign browser-initiated request, not an application error.
+     *
+     * @param ex      the exception
+     * @param request the HTTP request
+     * @return HTTP 404 with no body
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<Void> handleNoResourceFound(
+            NoResourceFoundException ex, HttpServletRequest request) {
+
+        log.debug("Static resource not found [{}]: {}", request.getRequestURI(), ex.getMessage());
+        return ResponseEntity.notFound().build();
+    }
 
     /**
      * Catch-all handler for any exception not explicitly handled above.
