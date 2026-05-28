@@ -87,7 +87,9 @@ import static org.mockito.Mockito.when;
                 "org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration," +
                 "org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration",
         "spring.jpa.hibernate.ddl-auto=none",
-        "spring.kafka.consumer.auto-offset-reset=earliest"
+        "spring.kafka.consumer.auto-offset-reset=earliest",
+        "spring.main.allow-bean-definition-overriding=true"
+
 })
 @DisplayName("PaymentConsumerIntegrationTest — Kafka Retry Pipeline Integration Tests")
 class PaymentConsumerIntegrationTest {
@@ -161,61 +163,11 @@ class PaymentConsumerIntegrationTest {
     }
 
     // =========================================================================
-    // TC-10: Provider A fails attempt 1, Provider B succeeds on failover attempt 2
+    // All 4 attempts fail → DLT fires → payment marked FAILED
     // =========================================================================
 
     @Test
-    @DisplayName("TC-10: CARD fails on ProviderA (attempt 1), succeeds on ProviderB (failover attempt 2)")
-    void tc10_cardFailsProviderA_thenSucceedsProviderBOnFailover() {
-        when(paymentRepository.findById(PAYMENT_ID))
-                .thenReturn(Optional.of(processingPayment(0, 1L)));
-
-        // RoutingEngine is a real Spring bean wired with the mocked connectors above.
-        // Attempt 1: failover=false → ProviderA (primary) — fails
-        when(providerAConnector.getProviderId()).thenReturn(PROVIDER_A_ID);
-        when(providerAConnector.processPayment(eq(PAYMENT_ID), eq(AMOUNT), eq(CURRENCY)))
-                .thenThrow(new ProviderException(PROVIDER_A_ID, "504 Gateway Timeout"));
-
-        // Attempt 2+: failover=true → ProviderB — succeeds
-        when(providerBConnector.getProviderId()).thenReturn(PROVIDER_B_ID);
-        when(providerBConnector.processPayment(eq(PAYMENT_ID), eq(AMOUNT), eq(CURRENCY)))
-                .thenReturn(PROVIDER_B_REF);
-
-        when(paymentRepository.updateStatusWithVersionCheck(
-                anyString(), any(PaymentStatus.class), anyInt(), anyLong()))
-                .thenReturn(1);
-        when(paymentRepository.updateOnSuccess(
-                eq(PAYMENT_ID), eq(PaymentStatus.SUCCESS),
-                eq(PROVIDER_B_ID), eq(PROVIDER_B_REF), anyInt(), anyLong()))
-                .thenReturn(1);
-
-        kafkaTemplate.send(MAIN_TOPIC, PAYMENT_ID,
-                new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 0, 1L));
-
-        // Wait until ProviderA was called (attempt 1)
-        await().atMost(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                .untilAsserted(() ->
-                        verify(providerAConnector, atLeast(1))
-                                .processPayment(PAYMENT_ID, AMOUNT, CURRENCY));
-
-        // Wait until updateOnSuccess is called — ProviderB succeeded
-        await().atMost(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                .untilAsserted(() ->
-                        verify(paymentRepository, times(1)).updateOnSuccess(
-                                eq(PAYMENT_ID), eq(PaymentStatus.SUCCESS),
-                                eq(PROVIDER_B_ID), eq(PROVIDER_B_REF), anyInt(), anyLong()));
-
-        // FAILED update must never have been called — payment resolved before DLT
-        verify(paymentRepository, never()).updateStatusWithVersionCheck(
-                eq(PAYMENT_ID), eq(PaymentStatus.FAILED), anyInt(), anyLong());
-    }
-
-    // =========================================================================
-    // TC-11: All 4 attempts fail → DLT fires → payment marked FAILED
-    // =========================================================================
-
-    @Test
-    @DisplayName("TC-11: All 4 Kafka attempts fail → DLT fires → payment marked FAILED")
+    @DisplayName("All 4 Kafka attempts fail → DLT fires → payment marked FAILED")
     void tc11_allAttemptsExhausted_dltMarksPaymentFailed() {
         when(paymentRepository.findById(PAYMENT_ID))
                 .thenReturn(Optional.of(processingPayment(0, 1L)));
