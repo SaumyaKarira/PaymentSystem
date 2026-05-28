@@ -252,9 +252,10 @@ class PaymentConsumerIntegrationTest {
                 MAIN_TOPIC + "-dlt", 0, 100L, PAYMENT_ID,
                 new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 4, 4L));
 
-        retryConsumer.handleDlt(dltRecord, null);
+        retryConsumer.handleDlt(dltRecord, null, null);
 
         // Already FAILED → updateStatusWithVersionCheck must NOT be called again
+        // deliveryAttempt=null falls back to TOTAL_CONFIGURED_ATTEMPTS inside handleDlt
         verify(paymentRepository, never()).updateStatusWithVersionCheck(
                 anyString(), eq(PaymentStatus.FAILED), anyInt(), anyLong());
     }
@@ -276,7 +277,7 @@ class PaymentConsumerIntegrationTest {
                 MAIN_TOPIC + "-dlt", 0, 200L, PAYMENT_ID,
                 new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 4, 4L));
 
-        assertThatCode(() -> retryConsumer.handleDlt(dltRecord, null))
+        assertThatCode(() -> retryConsumer.handleDlt(dltRecord, null, null))
                 .doesNotThrowAnyException();
 
         verify(paymentRepository, never()).updateStatusWithVersionCheck(

@@ -24,53 +24,64 @@ import org.springframework.transaction.annotation.Transactional;
 import java.nio.charset.StandardCharsets;
 
 /**
- * PaymentRetryConsumer — the Kafka consumer responsible for non-blocking retry processing
- * of failed payments.
+ * PaymentRetryConsumer — Kafka consumer responsible for non-blocking retry processing
+ * of failed payments via Spring Kafka's {@code @RetryableTopic} infrastructure.
  *
- * <h2>How @RetryableTopic Works (Spring Kafka Non-Blocking Retry)</h2>
- * <p>When {@code processPayment()} throws an exception, Spring Kafka's
- * {@code RetryTopicConfigurationSupport} intercepts the exception and:
+ * <h2>How @RetryableTopic Works (Non-Blocking Retry)</h2>
+ * <p>When {@code processPayment()} throws an exception, Spring Kafka intercepts it and:
  * <ol>
- *   <li>Publishes the original message to the next retry topic
- *       ({@code payment-main-topic-retry-0}, {@code ...-retry-1}, etc.)
- *       with a {@code kafka_backoff_timestamp} header set to now + backoff delay.</li>
- *   <li>Acknowledges the offset on the current topic immediately (the message is not
- *       "re-queued" on the same topic; it moves to the next retry topic).</li>
- *   <li>The retry topic consumer pauses the relevant partition until the backoff
- *       timestamp is reached, then resumes processing — this is what makes it
- *       "non-blocking" (no Thread.sleep, no blocked consumer threads).</li>
- *   <li>After all retry attempts are exhausted, the message is forwarded to the
- *       Dead Letter Topic (DLT): {@code payment-main-topic-dlt}.</li>
+ *   <li>Publishes the message to the next retry topic with a {@code kafka_backoff_timestamp}
+ *       header set to now + backoff delay.</li>
+ *   <li>Acknowledges the offset on the current topic immediately.</li>
+ *   <li>The retry consumer pauses its partition until the backoff timestamp is reached,
+ *       then resumes — no Thread.sleep, no blocked consumer threads.</li>
+ *   <li>After all attempts are exhausted the message is forwarded to the DLT.</li>
  * </ol>
  *
- * <h2>Generated Retry Topic Names</h2>
- * <p>With {@code attempts=4} (1 original + 3 retries) and the default suffix strategy:
+ * <h2>Retry Topic Layout (attempts=4)</h2>
  * <pre>
- *   payment-main-topic               ← original topic (attempt 1)
- *   payment-main-topic-retry-0       ← retry attempt 2 (after 2s)
- *   payment-main-topic-retry-1       ← retry attempt 3 (after 4s)
- *   payment-main-topic-retry-2       ← retry attempt 4 (after 8s)
- *   payment-main-topic-dlt           ← dead letter topic
+ *   payment-main-topic               ← attempt 1  (deliveryAttempt header = 1)
+ *   payment-main-topic-retry-0       ← attempt 2  (deliveryAttempt header = 2, after 2s)
+ *   payment-main-topic-retry-1       ← attempt 3  (deliveryAttempt header = 3, after 4s)
+ *   payment-main-topic-retry-2       ← attempt 4  (deliveryAttempt header = 4, after 8s)
+ *   payment-main-topic-dlt           ← all attempts exhausted
  * </pre>
  *
- * <h2>Failover Strategy</h2>
- * <p>On the first retry attempt, {@code retryCount >= 1}, we switch to the alternate
- * provider (failover=true in RoutingEngine).  This means:
+ * <h2>retryCount Tracking — The Bug That Was Fixed</h2>
+ * <p>Previously {@code retryCount} was calculated as {@code payment.getRetryCount() + 1},
+ * reading the value from the database. This was unreliable because:
  * <ul>
- *   <li>Attempt 1 (original):   CARD → Provider A</li>
- *   <li>Attempt 2 (retry-0):    CARD → Provider B (failover)</li>
- *   <li>Attempt 3 (retry-1):    CARD → Provider B (failover, still)</li>
- *   <li>Attempt 4 (retry-2):    CARD → Provider B (failover, still)</li>
- *   <li>DLT:                    All attempts exhausted → mark FAILED</li>
+ *   <li>The previous attempt's DB update may have returned {@code rowsUpdated=0} due to
+ *       an optimistic lock conflict, leaving the DB value stale (still 0).</li>
+ *   <li>The DB value represents "what was persisted last time", not "how many Kafka
+ *       deliveries have actually occurred".</li>
  * </ul>
  *
- * <h2>Concurrency Safety with Optimistic Locking</h2>
- * <p>Between retry attempts, a human operator or another service might manually update
- * the payment status (e.g., to SUCCESS via a back-office tool).  The version-guarded
- * DB update ({@code WHERE version = :version}) ensures the Kafka consumer never
- * overwrites a more recent state.  If a version conflict is detected, the consumer
- * logs the conflict and does NOT re-throw — the offset is committed and the message
- * is considered "handled" (the concurrent update wins).
+ * <h2>The Fix: Use KafkaHeaders.DELIVERY_ATTEMPT as the authoritative counter</h2>
+ * <p>Spring Kafka's {@code @RetryableTopic} infrastructure injects a
+ * {@code kafka_deliveryAttempt} header into every message. This is a monotonically
+ * increasing integer starting at 1 (first delivery = 1, first retry = 2, etc.) and
+ * is maintained by Spring Kafka's internal state — it is ALWAYS accurate regardless
+ * of what happened to the DB in previous attempts.
+ *
+ * <p>The mapping from header to DB column:
+ * <pre>
+ *   deliveryAttempt = 1  → first delivery (original topic) → fails → retryCount stored = 1
+ *   deliveryAttempt = 2  → first retry   (retry-0)         → fails → retryCount stored = 2
+ *   deliveryAttempt = 3  → second retry  (retry-1)         → fails → retryCount stored = 3
+ *   deliveryAttempt = 4  → third retry   (retry-2)         → fails → DLT fires
+ *   DLT handler                                                     → retryCount stored = totalAttempts (4)
+ * </pre>
+ *
+ * <p>On SUCCESS, retryCount = deliveryAttempt (the attempt that finally succeeded).
+ * On FAILURE of each attempt, retryCount = deliveryAttempt (attempts completed so far).
+ * On DLT, retryCount = totalConfiguredAttempts (all attempts were exhausted).
+ *
+ * <h2>Concurrency Safety</h2>
+ * <p>All DB updates use version-guarded JPQL ({@code WHERE version = :version}).
+ * If {@code rowsUpdated == 0}, another thread already changed this row (optimistic lock
+ * conflict). We log the conflict and do NOT re-throw — the concurrent update wins and
+ * the Kafka offset is committed normally.
  */
 @Slf4j
 @Component
@@ -81,40 +92,31 @@ public class PaymentRetryConsumer {
     private final RoutingEngine routingEngine;
 
     /**
+     * Total number of Kafka delivery attempts configured via {@code @RetryableTopic(attempts="4")}.
+     * Used by the DLT handler to record the final retry count when all attempts are exhausted.
+     *
+     * <p>Keep this in sync with the {@code attempts} value in {@code @RetryableTopic} below.
+     * If you change {@code attempts="4"} to a different value, update this constant too.
+     */
+    private static final int TOTAL_CONFIGURED_ATTEMPTS = 4;
+
+    /**
      * Primary Kafka listener with non-blocking retry configuration.
      *
      * <p>Annotation breakdown:
      * <ul>
-     *   <li>{@code attempts=4}: 1 initial attempt + 3 retry attempts.  Spring Kafka
-     *       generates 3 retry topics ({@code retry-0}, {@code retry-1}, {@code retry-2}).</li>
-     *   <li>{@code backoff}: Exponential backoff starting at 2000ms with multiplier 2.0:
-     *       2s → 4s → 8s between attempts.</li>
-     *   <li>{@code autoCreateTopics=true}: Spring Kafka auto-creates the retry and DLT topics
-     *       on the local Kafka broker if they don't exist.  For production, create topics
-     *       explicitly with the correct replication factor.</li>
-     *   <li>{@code topicSuffixingStrategy=SUFFIX_WITH_INDEX_VALUE}: topics are named
+     *   <li>{@code attempts=4}: 1 initial attempt + 3 retry attempts.</li>
+     *   <li>{@code backoff}: Exponential backoff — 2s → 4s → 8s between attempts.</li>
+     *   <li>{@code autoCreateTopics=true}: Spring Kafka auto-creates retry and DLT topics.</li>
+     *   <li>{@code topicSuffixingStrategy=SUFFIX_WITH_INDEX_VALUE}: topics named
      *       {@code payment-main-topic-retry-0}, {@code ...-retry-1}, {@code ...-retry-2}.</li>
      * </ul>
-     *
-     * <p>{@code @KafkaListener}: Subscribes this method to {@code payment-main-topic}.
-     * The {@code containerFactory} bean is the one we configured in {@link org.example.config.KafkaConsumerConfig}.
      */
     @RetryableTopic(
-            // Total attempts including the original = 4 (so 3 retries after the first failure)
             attempts = "4",
-            backoff = @Backoff(
-                    // Initial delay before the first retry: 2 seconds
-                    delay = 2000,
-                    // Multiplier: each subsequent retry doubles the wait time.
-                    // retry-0 waits 2s, retry-1 waits 4s, retry-2 waits 8s
-                    multiplier = 2.0
-            ),
-            // Auto-create retry and DLT topics on the local Kafka broker.
-            // Topics created: payment-main-topic-retry-0, -retry-1, -retry-2, -dlt
+            backoff = @Backoff(delay = 2000, multiplier = 2.0),
             autoCreateTopics = "true",
-            // Use the numeric index in the topic suffix (retry-0, retry-1, retry-2).
             topicSuffixingStrategy = TopicSuffixingStrategy.SUFFIX_WITH_INDEX_VALUE,
-            // Use the containerFactory bean from KafkaConsumerConfig
             kafkaTemplate = "kafkaTemplate"
     )
     @KafkaListener(
@@ -125,58 +127,83 @@ public class PaymentRetryConsumer {
     @Transactional
     public void processPayment(
             ConsumerRecord<String, PaymentEvent> record,
+
+            // ── KAFKA HEADER: RECEIVED_TOPIC ─────────────────────────────────────
+            // The topic this specific delivery came from. Used for logging only.
+            // Value: "payment-main-topic", "payment-main-topic-retry-0", etc.
             @Header(KafkaHeaders.RECEIVED_TOPIC) String topic,
+
+            // ── KAFKA HEADER: DELIVERY_ATTEMPT ────────────────────────────────────
+            // Spring Kafka's @RetryableTopic infrastructure injects this header
+            // automatically. It is a 1-based monotonically increasing integer:
+            //   - First delivery on payment-main-topic          → deliveryAttempt = 1
+            //   - First retry   on payment-main-topic-retry-0   → deliveryAttempt = 2
+            //   - Second retry  on payment-main-topic-retry-1   → deliveryAttempt = 3
+            //   - Third retry   on payment-main-topic-retry-2   → deliveryAttempt = 4
+            //
+            // required=false: the header is absent on the very first delivery on the
+            // main topic; in that case we default to 1.
             @Header(name = KafkaHeaders.DELIVERY_ATTEMPT, required = false) Integer deliveryAttempt
     ) {
         PaymentEvent event = record.value();
-        int attempt = deliveryAttempt != null ? deliveryAttempt : 1;
 
-        log.info("Kafka retry consumer: processing payment [{}] from topic [{}], attempt #{}",
-                event.paymentId(), topic, attempt);
+        // ── DELIVERY_ATTEMPT → retryCount MAPPING ────────────────────────────────
+        //
+        // deliveryAttempt is 1-based. We use it directly as retryCount in MySQL:
+        //   attempt 1 → retryCount = 1  (1 Kafka delivery has occurred)
+        //   attempt 2 → retryCount = 2  (2 Kafka deliveries have occurred)
+        //   attempt 3 → retryCount = 3
+        //   attempt 4 → retryCount = 4
+        //
+        // This is the AUTHORITATIVE counter. It does NOT depend on what the DB holds —
+        // it is maintained by Spring Kafka's internal retry state machine and is always
+        // accurate even if previous DB updates failed due to optimistic lock conflicts.
+        //
+        // NOTE: we do NOT use payment.getRetryCount() + 1 here. That DB value could be
+        // stale (stuck at 0 or any previous value) if a prior attempt's version-guarded
+        // UPDATE returned rowsUpdated=0. Using deliveryAttempt eliminates that staleness.
+        final int deliveryAttemptValue = (deliveryAttempt != null) ? deliveryAttempt : 1;
 
-        // ── FETCH CURRENT PAYMENT STATE FROM MYSQL ────────────────────────────
-        // Re-fetch the payment from DB to get the latest version number.
-        // We cannot rely on the version embedded in the PaymentEvent because the
-        // payment may have been updated between when the event was published and now.
+        log.info("Kafka consumer: processing payment [{}] from topic [{}], deliveryAttempt={}",
+                event.paymentId(), topic, deliveryAttemptValue);
+
+        // ── FETCH CURRENT PAYMENT STATE FROM MYSQL ──────────────��────────────────
+        // Always re-fetch from DB to get the latest version number for the optimistic
+        // lock guard. We cannot use the version embedded in the PaymentEvent because
+        // the entity may have been updated by a prior retry attempt since the event
+        // was first published.
         Payment payment = paymentRepository.findById(event.paymentId()).orElse(null);
         if (payment == null) {
-            // Payment not found — this should not happen in normal operation.
-            // Could occur if a payment was deleted (e.g., admin cleanup).
-            // Log and do NOT throw — throwing would cause another retry cycle.
-            log.error("Payment [{}] not found in DB during retry processing. Skipping.", event.paymentId());
+            // Payment deleted between event publication and this delivery — skip cleanly.
+            // Do NOT throw: throwing would trigger another retry cycle for a non-existent payment.
+            log.error("Payment [{}] not found in DB during retry processing (attempt={}). "
+                    + "Skipping — payment may have been deleted.", event.paymentId(), deliveryAttemptValue);
             return;
         }
 
-        // ── SKIP IF ALREADY COMPLETED ─────────────────────────────────────────
-        // If the payment is already SUCCESS or FAILED, skip processing.
-        // This handles the case where a concurrent HTTP request or earlier retry
-        // already resolved the payment — no need to do duplicate work.
-        if (payment.getStatus() == org.example.entity.PaymentStatus.SUCCESS
-                || payment.getStatus() == org.example.entity.PaymentStatus.FAILED) {
-            log.info("Payment [{}] already in terminal state [{}]. Skipping retry.",
-                    event.paymentId(), payment.getStatus());
+        // ── SKIP IF ALREADY IN A TERMINAL STATE ──────────────────────────────────
+        // Handles the race condition where a concurrent HTTP request or an earlier Kafka
+        // retry already resolved the payment to SUCCESS or FAILED between the time this
+        // message was published and now. No work needed — commit the offset and move on.
+        if (payment.getStatus() == PaymentStatus.SUCCESS
+                || payment.getStatus() == PaymentStatus.FAILED) {
+            log.info("Payment [{}] already in terminal state [{}] at deliveryAttempt={}. Skipping.",
+                    event.paymentId(), payment.getStatus(), deliveryAttemptValue);
             return;
         }
 
-        // ── FAILOVER LOGIC ────────────────────────────────────────────────────
-        // On the first retry (attempt >= 2) and beyond, we switch to the alternate
-        // provider.  The retryCount embedded in the event indicates how many times
-        // the original orchestrator service attempted this payment (should be 0 on
-        // first entry to Kafka).  We use the Kafka delivery attempt header for routing.
-        //
-        // failover=true → RoutingEngine selects the ALTERNATE provider:
-        //   CARD: Provider A (primary) → Provider B (failover)
-        //   UPI:  Provider B (primary) → Provider A (failover)
-        boolean useFailover = attempt > 1;
+        // ── FAILOVER ROUTING ──────────────────────────────────────────────────────
+        // deliveryAttempt=1 → first delivery → use PRIMARY provider (failover=false)
+        // deliveryAttempt≥2 → retries       → use ALTERNATE provider (failover=true)
+        //   CARD: ProviderA (primary) → ProviderB (failover)
+        //   UPI:  ProviderB (primary) → ProviderA (failover)
+        boolean useFailover = deliveryAttemptValue > 1;
         PaymentProviderConnector connector = routingEngine.route(event.paymentMethod(), useFailover);
 
-        log.info("Payment [{}] retry attempt #{}: routing to provider [{}] (failover={})",
-                event.paymentId(), attempt, connector.getProviderId(), useFailover);
+        log.info("Payment [{}] deliveryAttempt={}: routing to provider [{}] (failover={})",
+                event.paymentId(), deliveryAttemptValue, connector.getProviderId(), useFailover);
 
-        // Increment the retry count on the in-memory entity (will be persisted on success)
-        int newRetryCount = payment.getRetryCount() + 1;
-
-        // ── ATTEMPT PROVIDER CALL ─────────────────────────────────────────────
+        // ── ATTEMPT PROVIDER CALL ─────────────────────────────────────────────────
         try {
             String providerRefId = connector.processPayment(
                     payment.getId(),
@@ -184,148 +211,187 @@ public class PaymentRetryConsumer {
                     payment.getCurrency()
             );
 
-            // ── SUCCESS: UPDATE DB TO SUCCESS STATE ───────────────────────────
-            // Use version-guarded update to prevent overwriting concurrent modifications.
+            // ── SUCCESS PATH ──────────────────────────────────────────────────────
+            // retryCount = deliveryAttemptValue: records that this delivery attempt was
+            // the one that finally succeeded. This is the authoritative Kafka-based count.
+            //
+            // Version-guarded UPDATE (WHERE version = :version):
+            //   - If rowsUpdated=1: success, DB is now consistent.
+            //   - If rowsUpdated=0: optimistic lock conflict — another thread updated
+            //     this row concurrently. The other update wins; we log and move on.
+            //     The Kafka offset is still committed (no re-throw).
             int rowsUpdated = paymentRepository.updateOnSuccess(
                     payment.getId(),
                     PaymentStatus.SUCCESS,
                     connector.getProviderId(),
                     providerRefId,
-                    newRetryCount,
-                    payment.getVersion()
+                    deliveryAttemptValue,   // ← AUTHORITATIVE: Kafka delivery count, not DB value
+                    payment.getVersion()    // ← optimistic lock guard from freshly fetched entity
             );
 
             if (rowsUpdated == 0) {
-                // Optimistic lock conflict: another thread updated this row between our
-                // SELECT (findById above) and this UPDATE.
-                // This is safe to ignore — the other update is presumed correct.
-                log.warn("Optimistic lock conflict during retry SUCCESS update for payment [{}]. "
-                        + "Concurrent update detected; skipping this update.", payment.getId());
+                log.warn("Optimistic lock conflict on SUCCESS update for payment [{}] "
+                        + "(deliveryAttempt={}, version={}). Concurrent update detected; "
+                        + "skipping — the concurrent update takes precedence.",
+                        payment.getId(), deliveryAttemptValue, payment.getVersion());
             } else {
-                log.info("Payment [{}] succeeded on retry attempt #{} via provider [{}]. Ref: {}",
-                        payment.getId(), attempt, connector.getProviderId(), providerRefId);
+                log.info("Payment [{}] → SUCCESS on deliveryAttempt={} via provider [{}]. "
+                        + "retryCount={} persisted to DB. Ref: {}",
+                        payment.getId(), deliveryAttemptValue, connector.getProviderId(),
+                        deliveryAttemptValue, providerRefId);
             }
 
-            // Do NOT throw — returning normally commits the Kafka offset.
+            // Returning normally commits the Kafka offset — @RetryableTopic does NOT retry.
 
         } catch (ProviderException providerEx) {
-            // ── PROVIDER FAILED: LET @RetryableTopic HANDLE RE-ROUTING ────────
-            // By re-throwing the exception, we signal to Spring Kafka's retry
-            // infrastructure that this message should be forwarded to the next
-            // retry topic (or DLT if all attempts are exhausted).
+            // ── FAILURE PATH ──────────────────────────────────────────────────────
+            // Provider call failed. We persist the current attempt count to the DB
+            // for observability (so operators can see progress in MySQL), then re-throw
+            // to let @RetryableTopic forward the message to the next retry topic.
             //
-            // Spring Kafka will:
-            //   1. NOT commit the offset on the current retry topic
-            //   2. Publish the message to payment-main-topic-retry-N+1
-            //   3. Set the kafka_backoff_timestamp header
-            //
-            // We update the retry count in DB here so the DB reflects the current attempt,
-            // even though the payment remains in PROCESSING state.
-            log.warn("Payment [{}] failed on retry attempt #{} via provider [{}]: {}",
-                    payment.getId(), attempt, providerEx.getProviderName(), providerEx.getMessage());
+            // retryCount = deliveryAttemptValue:
+            //   Records "this many Kafka deliveries have been attempted so far".
+            //   Using deliveryAttemptValue is safe even if the previous DB update
+            //   was lost (rowsUpdated=0), because this value comes from Kafka headers,
+            //   not from the potentially-stale DB column.
+            log.warn("Payment [{}] FAILED on deliveryAttempt={} via provider [{}]: {}. "
+                    + "Persisting retryCount={} to DB before forwarding to next retry topic.",
+                    payment.getId(), deliveryAttemptValue, providerEx.getProviderName(),
+                    providerEx.getMessage(), deliveryAttemptValue);
 
-            // Version-guarded update of retry count (payment remains in PROCESSING)
+            // Version-guarded update: persist attempt count, keep status=PROCESSING.
+            // If rowsUpdated=0 (version conflict), the count update is lost for this
+            // attempt — tolerable because deliveryAttemptValue on the NEXT delivery will
+            // still be correct (Kafka maintains this independently of DB state).
             try {
                 int rowsUpdated = paymentRepository.updateStatusWithVersionCheck(
                         payment.getId(),
                         PaymentStatus.PROCESSING,
-                        newRetryCount,
-                        payment.getVersion()
+                        deliveryAttemptValue,   // ← AUTHORITATIVE: Kafka delivery count
+                        payment.getVersion()    // ← optimistic lock guard
                 );
                 if (rowsUpdated == 0) {
-                    log.warn("Version conflict updating retry count for payment [{}]. Ignoring.", payment.getId());
+                    log.warn("Optimistic lock conflict persisting retryCount={} for payment [{}] "
+                            + "(version={}). DB retryCount may lag by one attempt — "
+                            + "next delivery will self-correct via deliveryAttempt header.",
+                            deliveryAttemptValue, payment.getId(), payment.getVersion());
+                } else {
+                    log.debug("Payment [{}] retryCount={} persisted to DB after failed attempt.",
+                            payment.getId(), deliveryAttemptValue);
                 }
             } catch (OptimisticLockingFailureException lockEx) {
-                // If the version-guarded update itself fails, log and continue.
-                // The retry count discrepancy is tolerable — DLT will still fire correctly.
-                log.warn("OptimisticLockingFailureException updating retry count for payment [{}]: {}",
+                // Hibernate-level optimistic lock collision (thrown before UPDATE executes).
+                // Same semantics as rowsUpdated=0 — tolerable, log and continue.
+                log.warn("OptimisticLockingFailureException persisting retryCount for payment [{}]: {}",
                         payment.getId(), lockEx.getMessage());
             }
 
-            // Re-throw to trigger @RetryableTopic forwarding to the next retry topic.
-            // This is the critical path: throwing tells Spring Kafka the message was NOT
-            // successfully processed and must be retried.
+            // Re-throw to signal @RetryableTopic: this delivery failed, forward to retry-N+1.
+            // If this was the last attempt (deliveryAttempt=4), @RetryableTopic forwards to DLT.
             throw providerEx;
         }
     }
 
     /**
-     * Dead Letter Topic (DLT) handler — called when ALL retry attempts are exhausted.
+     * Dead Letter Topic (DLT) handler — invoked when ALL retry attempts are exhausted.
      *
-     * <p>This method is invoked by Spring Kafka when a message has been forwarded to
-     * {@code payment-main-topic-dlt} after failing all retry attempts.
+     * <p>Spring Kafka calls this method after the message has been forwarded to
+     * {@code payment-main-topic-dlt}, meaning all {@code TOTAL_CONFIGURED_ATTEMPTS}
+     * Kafka deliveries have failed.
      *
-     * <h2>Responsibilities</h2>
-     * <ol>
-     *   <li>Mark the payment as FAILED in MySQL</li>
-     *   <li>Log the final exception stack trace embedded in the Kafka headers</li>
-     *   <li>Optionally trigger alerting or incident creation (not implemented here)</li>
-     * </ol>
+     * <h2>retryCount in the DLT handler</h2>
+     * <p>{@code deliveryAttempt} from the Kafka header is the authoritative final count.
+     * We fall back to {@code TOTAL_CONFIGURED_ATTEMPTS} when the header is absent (e.g.,
+     * in direct unit-test invocations where Spring header resolution is bypassed).
+     * This ensures the DB always reflects the true exhausted attempt count regardless of
+     * whether any intermediate {@code processPayment()} DB updates were lost to version
+     * conflicts.
      *
      * <h2>Exception Header</h2>
-     * <p>Spring Kafka adds a {@code kafka_dlt-exception-stacktrace} header to DLT messages
-     * containing the full stack trace of the last exception.  We extract and log this
-     * header to aid post-mortem debugging without needing to reproduce the error.
+     * <p>Spring Kafka attaches a {@code kafka_dlt-exception-stacktrace} header to every
+     * DLT message. We extract and log it here for post-mortem debugging.
      *
-     * @param record            the Kafka record that landed on the DLT
-     * @param exceptionHeader   the exception stack trace from the last failed attempt
+     * <h2>Unit-test invocation</h2>
+     * <p>Tests that call this method directly on a manually-constructed instance should
+     * pass {@code null} for both {@code exceptionHeader} and {@code deliveryAttempt}.
+     * The {@code null} delivery attempt safely falls back to {@code TOTAL_CONFIGURED_ATTEMPTS}.
+     *
+     * @param record              the Kafka record that landed on the DLT
+     * @param exceptionHeader     the exception stacktrace bytes (may be null)
+     * @param deliveryAttempt     the final delivery attempt count from the Kafka header (may be null)
      */
     @DltHandler
     @Transactional
     public void handleDlt(
             ConsumerRecord<String, PaymentEvent> record,
-            @Header(name = "kafka_dlt-exception-stacktrace", required = false) byte[] exceptionHeader
+            @Header(name = "kafka_dlt-exception-stacktrace", required = false) byte[] exceptionHeader,
+            @Header(name = KafkaHeaders.DELIVERY_ATTEMPT, required = false) Integer deliveryAttempt
     ) {
         PaymentEvent event = record.value();
 
-        // Extract the final exception stack trace from the Kafka DLT header for logging.
-        // This header is set automatically by Spring Kafka's retry infrastructure.
-        String stackTrace = exceptionHeader != null
+        // ── DELIVERY_ATTEMPT → finalRetryCount MAPPING ───────────────────────────
+        //
+        // Use the Kafka header value if present; fall back to TOTAL_CONFIGURED_ATTEMPTS.
+        // This guarantees that retryCount in the DB always equals the actual number of
+        // Kafka deliveries attempted, even if some intermediate DB updates were lost.
+        final int finalRetryCount = (deliveryAttempt != null)
+                ? deliveryAttempt
+                : TOTAL_CONFIGURED_ATTEMPTS;
+
+        // Extract the final exception stack trace for post-mortem observability.
+        String stackTrace = (exceptionHeader != null)
                 ? new String(exceptionHeader, StandardCharsets.UTF_8)
                 : "No stack trace header available";
 
-        log.error("DLT HANDLER: Payment [{}] has exhausted all retry attempts. "
-                        + "Marking as FAILED.\nFinal exception stack trace:\n{}",
-                event.paymentId(), stackTrace);
+        log.error("DLT HANDLER: Payment [{}] has exhausted all {} Kafka delivery attempts. "
+                + "Marking as FAILED with finalRetryCount={}.\nFinal exception:\n{}",
+                event.paymentId(), finalRetryCount, finalRetryCount, stackTrace);
 
-        // Fetch the current state of the payment from MySQL
+        // ── FETCH CURRENT PAYMENT STATE ────────────────────────────────────────��──
         Payment payment = paymentRepository.findById(event.paymentId()).orElse(null);
         if (payment == null) {
-            log.error("DLT HANDLER: Payment [{}] not found in DB. Cannot mark as FAILED.", event.paymentId());
+            log.error("DLT HANDLER: Payment [{}] not found in DB. Cannot mark as FAILED.",
+                    event.paymentId());
             return;
         }
 
-        // Skip if already in a terminal state (e.g., SUCCESS from a concurrent thread)
-        if (payment.getStatus() == PaymentStatus.SUCCESS || payment.getStatus() == PaymentStatus.FAILED) {
-            log.warn("DLT HANDLER: Payment [{}] already in terminal state [{}]. Skipping FAILED update.",
+        // ── SKIP IF ALREADY IN TERMINAL STATE ────────────────────────────────────
+        // Guard against the race where a concurrent synchronous SUCCESS resolved the
+        // payment between the last Kafka retry and this DLT delivery.
+        if (payment.getStatus() == PaymentStatus.SUCCESS
+                || payment.getStatus() == PaymentStatus.FAILED) {
+            log.warn("DLT HANDLER: Payment [{}] already in terminal state [{}]. "
+                    + "Skipping FAILED update (concurrent update took precedence).",
                     event.paymentId(), payment.getStatus());
             return;
         }
 
-        // ── MARK AS FAILED ────────────────────────────────────────────────────
-        // Use a version-guarded update to prevent overwriting any concurrent SUCCESS.
-        // If rowsUpdated == 0, another thread already advanced the state — no action needed.
+        // ── MARK AS FAILED ────────────────────────────────────────────────────────
+        // finalRetryCount = authoritative Kafka-based attempt count (not DB-sourced).
+        // Version-guarded UPDATE ensures we never overwrite a concurrent SUCCESS.
+        //   rowsUpdated=1 → DB now reflects FAILED with correct retryCount.
+        //   rowsUpdated=0 → another thread updated the row; their update takes precedence.
         try {
             int rowsUpdated = paymentRepository.updateStatusWithVersionCheck(
                     payment.getId(),
                     PaymentStatus.FAILED,
-                    payment.getRetryCount(),
-                    payment.getVersion()
+                    finalRetryCount,        // ← AUTHORITATIVE: Kafka delivery count
+                    payment.getVersion()    // ← optimistic lock guard from fresh fetch
             );
 
             if (rowsUpdated > 0) {
-                log.error("DLT HANDLER: Payment [{}] successfully marked as FAILED after {} retry attempts.",
-                        event.paymentId(), payment.getRetryCount());
+                log.error("DLT HANDLER: Payment [{}] → FAILED. retryCount={} persisted to DB. "
+                        + "All {} Kafka delivery attempts were exhausted.",
+                        event.paymentId(), finalRetryCount, finalRetryCount);
             } else {
-                // rowsUpdated == 0 → version mismatch.
-                // A concurrent thread (possibly the sync API) updated the row.
-                // The concurrent update takes precedence — do not overwrite.
-                log.warn("DLT HANDLER: Version conflict marking payment [{}] as FAILED. "
-                        + "Row may have been concurrently updated to a different state.", event.paymentId());
+                log.warn("DLT HANDLER: Optimistic lock conflict marking payment [{}] as FAILED "
+                        + "(version={}). Row was concurrently updated — skipping.",
+                        event.paymentId(), payment.getVersion());
             }
         } catch (OptimisticLockingFailureException e) {
             // Hibernate-level optimistic lock collision in the DLT handler.
-            // Same semantics as above — log and do not re-throw (we don't want DLT re-processing).
+            // Do NOT re-throw — re-throwing would cause Spring Kafka to re-deliver
+            // the DLT message, triggering an infinite DLT retry loop.
             log.error("DLT HANDLER: OptimisticLockingFailureException marking payment [{}] as FAILED: {}",
                     event.paymentId(), e.getMessage());
         }

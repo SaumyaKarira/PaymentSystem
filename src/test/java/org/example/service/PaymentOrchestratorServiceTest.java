@@ -470,7 +470,8 @@ class PaymentOrchestratorServiceTest {
                                     PaymentMethod.CARD, 4, 4L));
 
             retryConsumer.handleDlt(dltRecord,
-                    "java.io.IOException: 504\n\tat org.example...".getBytes());
+                    "java.io.IOException: 504\n\tat org.example...".getBytes(),
+                    null);  // null deliveryAttempt → falls back to TOTAL_CONFIGURED_ATTEMPTS (4) inside handleDlt
 
             verify(paymentRepository).updateStatusWithVersionCheck(
                     PAYMENT_ID, PaymentStatus.FAILED, 4, 4L);
