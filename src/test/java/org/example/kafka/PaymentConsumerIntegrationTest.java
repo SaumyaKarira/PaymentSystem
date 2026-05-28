@@ -182,7 +182,7 @@ class PaymentConsumerIntegrationTest {
                 .thenReturn(1);
 
         kafkaTemplate.send(MAIN_TOPIC, PAYMENT_ID,
-                new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 0, 1L));
+                new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 0));
 
         // Wait until the DLT handler fires and marks the payment FAILED
         await().atMost(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
@@ -204,7 +204,7 @@ class PaymentConsumerIntegrationTest {
 
     @Test
     @DisplayName("Consumer is a no-op when payment is already in SUCCESS state")
-    void consumerSkipsAlreadySuccessfulPayment() throws Exception {
+    void consumerSkipsAlreadySuccessfulPayment() {
         Payment alreadySuccess = Payment.builder()
                 .id(PAYMENT_ID).idempotencyKey(IDEM_KEY).amount(AMOUNT).currency(CURRENCY)
                 .paymentMethod(PaymentMethod.CARD).status(PaymentStatus.SUCCESS)
@@ -216,10 +216,13 @@ class PaymentConsumerIntegrationTest {
         when(paymentRepository.findById(PAYMENT_ID)).thenReturn(Optional.of(alreadySuccess));
 
         kafkaTemplate.send(MAIN_TOPIC, PAYMENT_ID,
-                new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 0, 0L));
+                new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 0));
 
-        // Give the consumer time to process (fixed short wait since we assert absence)
-        Thread.sleep(5_000);
+        // Wait up to 5 s using Awaitility — verifies the consumer ran but took no action.
+        // We poll findById to confirm the consumer read the entity (the only DB call it makes),
+        // then assert that no write operations were triggered.
+        await().atMost(5, TimeUnit.SECONDS)
+                .untilAsserted(() -> verify(paymentRepository, atLeast(1)).findById(PAYMENT_ID));
 
         verify(providerAConnector, never()).processPayment(anyString(), any(), anyString());
         verify(providerBConnector, never()).processPayment(anyString(), any(), anyString());
@@ -249,7 +252,7 @@ class PaymentConsumerIntegrationTest {
 
         ConsumerRecord<String, PaymentEvent> dltRecord = new ConsumerRecord<>(
                 MAIN_TOPIC + "-dlt", 0, 100L, PAYMENT_ID,
-                new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 4, 4L));
+                new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 4));
 
         retryConsumer.handleDlt(dltRecord, null, null);
 
@@ -274,7 +277,7 @@ class PaymentConsumerIntegrationTest {
 
         ConsumerRecord<String, PaymentEvent> dltRecord = new ConsumerRecord<>(
                 MAIN_TOPIC + "-dlt", 0, 200L, PAYMENT_ID,
-                new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 4, 4L));
+                new PaymentEvent(PAYMENT_ID, AMOUNT, CURRENCY, PaymentMethod.CARD, 4));
 
         assertThatCode(() -> retryConsumer.handleDlt(dltRecord, null, null))
                 .doesNotThrowAnyException();

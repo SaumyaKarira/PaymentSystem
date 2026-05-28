@@ -227,8 +227,7 @@ public class PaymentOrchestratorService {
                         payment.getAmount(),
                         payment.getCurrency(),
                         payment.getPaymentMethod(),
-                        payment.getRetryCount(),
-                        payment.getVersion()
+                        payment.getRetryCount()
                 );
                 kafkaTemplate.send(mainTopic, payment.getId(), event);
                 log.info("Payment [{}] published to Kafka [{}] for non-blocking retry",

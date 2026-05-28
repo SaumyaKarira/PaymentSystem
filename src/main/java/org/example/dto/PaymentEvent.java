@@ -15,19 +15,23 @@ import java.math.BigDecimal;
  * for retry processing, rather than the full {@link org.example.entity.Payment} entity.
  * This decouples the Kafka message contract from the JPA entity schema.
  *
+ * <p>Note: The optimistic lock {@code version} is intentionally NOT included here.
+ * The consumer always re-fetches the payment entity from the database to obtain the
+ * latest version number before any update. Using a stale version from the event
+ * would cause unnecessary optimistic lock conflicts when a prior retry already
+ * incremented the version.
+ *
  * @param paymentId     the UUID of the payment to retry
  * @param amount        the original payment amount (for logging and audit)
  * @param currency      the original currency
- * @param paymentMethod CARD or UPI — used by the routing engine to select the fallback provider
+ * @param paymentMethod CARD or UPI — used by the routing engine to select the provider
  * @param retryCount    the retry attempt count at the time of publishing (starts at 0)
- * @param version       the optimistic lock version at publish time; used for version-guarded updates
  */
 public record PaymentEvent(
         String paymentId,
         BigDecimal amount,
         String currency,
         PaymentMethod paymentMethod,
-        int retryCount,
-        long version
+        int retryCount
 ) {}
 

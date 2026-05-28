@@ -8,17 +8,18 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  *
  * <p>{@code @SpringBootApplication} is a convenience annotation that combines:
  * <ul>
- *   <li>{@code @Configuration}       — marks this class as a source of bean definitions</li>
+ *   <li>{@code @Configuration}          — marks this class as a source of bean definitions</li>
  *   <li>{@code @EnableAutoConfiguration} — lets Spring Boot auto-configure beans based on
  *       classpath dependencies (e.g., DataSource, RedisTemplate, KafkaTemplate)</li>
- *   <li>{@code @ComponentScan}        — scans the {@code org.example} package and all
+ *   <li>{@code @ComponentScan}           — scans the {@code org.example} package and all
  *       sub-packages for Spring-managed components</li>
  * </ul>
  */
 @SpringBootApplication
-public class Main {
+public class PaymentOrchestrationApplication {
 
     public static void main(String[] args) {
-        SpringApplication.run(Main.class, args);
+        SpringApplication.run(PaymentOrchestrationApplication.class, args);
     }
 }
+

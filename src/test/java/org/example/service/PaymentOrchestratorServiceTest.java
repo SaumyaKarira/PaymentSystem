@@ -404,7 +404,7 @@ class PaymentOrchestratorServiceTest {
                     new org.apache.kafka.clients.consumer.ConsumerRecord<>(
                             MAIN_TOPIC + "-dlt", 0, 0L, PAYMENT_ID,
                             new PaymentEvent(PAYMENT_ID, new BigDecimal("150.00"), "USD",
-                                    PaymentMethod.CARD, 4, 4L));
+                                    PaymentMethod.CARD, 4));
 
             retryConsumer.handleDlt(dltRecord,
                     "java.io.IOException: 504\n\tat org.example...".getBytes(),

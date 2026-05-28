@@ -1,0 +1,103 @@
+##############################################################################
+# application-test.yml — Test profile configuration
+#
+# Activated automatically by @SpringBootTest and @ActiveProfiles("test").
+# Overrides production values in application.yml to use in-memory / embedded
+# infrastructure — no real MySQL, Redis, or Kafka required.
+##############################################################################
+
+spring:
+  application:
+    name: payment-orchestration-system-test
+
+  # ─────────────────────────────────────────────────────────────────
+  # DATASOURCE — H2 in-memory database for unit/integration tests
+  # Replaces the MySQL datasource from application.yml.
+  # H2 is automatically configured via Spring Boot's DataSource auto-config
+  # when spring-boot-starter-test is on the classpath.
+  # ─────────────────────────────────────────────────────────────────
+  datasource:
+    url: jdbc:h2:mem:payment_test_db;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;MODE=MySQL
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+
+  # ───────────────────────────��─────────────────────────────────────
+  # JPA / HIBERNATE — use H2 dialect, create schema from schema.sql
+  # ─────────────────────────────────────────────────────────────────
+  jpa:
+    hibernate:
+      ddl-auto: none
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+        format_sql: false
+    defer-datasource-initialization: true
+
+  # ─────────────────────────────────────────────────────────────────
+  # SQL INIT — run schema.sql on startup so tables exist for @DataJpaTest
+  # ─────────────────────────────────────────────────────────────────
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+
+  # ─────────────────────────────────────────────────────────────────
+  # REDIS — disabled for unit/service tests (mocked via @MockBean).
+  # Tests that need Redis behaviour (PaymentConsumerIntegrationTest) use
+  # @MockBean RedisTemplate directly and exclude Redis auto-config.
+  # ─────────────────────────────────────────────────────────────────
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  # ─────────────────────────────────────────────────────────────────
+  # KAFKA — overridden per-test by @EmbeddedKafka / @TestPropertySource.
+  # The placeholder here keeps auto-config from failing when tests that
+  # exclude Kafka auto-config are loaded with this profile.
+  # ─────────────────────────────────────────────────────────────────
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 1
+    consumer:
+      group-id: payment-retry-group-test
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "org.example.*"
+        enable.auto.commit: false
+
+# ─────────────────────────────────────────────────────────────────
+# SERVER — random port for integration tests; avoids port conflicts
+# ─────────────────────────────────────────────────────────────────
+server:
+  port: 0
+
+# ─────────────────────────────────────────────────────────────────
+# LOGGING — reduce noise in test output
+# ─────────────────────────────────────────────────────────────────
+logging:
+  level:
+    root: WARN
+    org.example: INFO
+    org.springframework.kafka: WARN
+    org.hibernate.SQL: OFF
+    org.springframework.test: INFO
+
+# ─────────────────────────────────────────────────────────────────
+# APPLICATION-SPECIFIC — test overrides
+# ─────────────────────────────────────────────────────────────────
+payment:
+  idempotency:
+    # Short TTL for tests so keys expire quickly and don't bleed across tests
+    ttl-seconds: 60
+  kafka:
+    main-topic: payment-main-topic
+
