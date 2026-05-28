@@ -12,8 +12,7 @@ import java.util.UUID;
  * ProviderAConnector — simulates integration with Payment Provider A.
  *
  * <p>This connector is selected by the {@code RoutingEngine} when the payment method
- * is {@code CARD}.  During Kafka retry cycles, if Provider A was the primary that failed,
- * the retry consumer falls back to Provider B for CARD payments.
+ * is {@code CARD}.
  *
  * <h2>Failure Simulation Logic</h2>
  * <p>To force the retry and DLQ infrastructure to activate, this connector intentionally

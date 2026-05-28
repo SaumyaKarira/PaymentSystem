@@ -324,11 +324,11 @@ class PaymentOrchestratorServiceTest {
     }
 
     // =========================================================================
-    // CATEGORY C — Resiliency: Kafka hand-off and failover routing
+    // CATEGORY C — Resiliency: Kafka hand-off
     // =========================================================================
 
     @Nested
-    @DisplayName("Category C — Resiliency, Kafka Hand-Off, and Failover")
+    @DisplayName("Category C — Resiliency and Kafka Hand-Off")
     class ResiliencyTests {
 
         /**
@@ -379,76 +379,13 @@ class PaymentOrchestratorServiceTest {
         }
 
         /**
-         * TC-10B: RoutingEngine correctly switches to failover provider
-         */
-        @Test
-        @DisplayName("TC-10B: RoutingEngine returns ProviderB for CARD failover, ProviderA for UPI failover")
-        void tc10b_routingEngineFailoverSwitchesProvider() {
-            // Use a real RoutingEngine instance with the mocked concrete connectors
-            RoutingEngine realRouter = new RoutingEngine(providerAConnector, providerBConnector);
-
-            assertThat(realRouter.route(PaymentMethod.CARD, false))
-                    .as("CARD primary → ProviderA").isSameAs(providerAConnector);
-            assertThat(realRouter.route(PaymentMethod.CARD, true))
-                    .as("CARD failover → ProviderB").isSameAs(providerBConnector);
-            assertThat(realRouter.route(PaymentMethod.UPI, false))
-                    .as("UPI primary → ProviderB").isSameAs(providerBConnector);
-            assertThat(realRouter.route(PaymentMethod.UPI, true))
-                    .as("UPI failover → ProviderA").isSameAs(providerAConnector);
-        }
-
-        /**
-         * TC-11: Kafka retry consumer uses failover provider on attempt #2 and succeeds
-         */
-        @Test
-        @DisplayName("TC-11: Kafka consumer attempt #2 uses failover ProviderB and marks SUCCESS")
-        void tc11_kafkaConsumerUsesFailoverOnAttempt2() {
-            RoutingEngine realRouter = new RoutingEngine(providerAConnector, providerBConnector);
-            org.example.kafka.PaymentRetryConsumer retryConsumer =
-                    new org.example.kafka.PaymentRetryConsumer(paymentRepository, realRouter);
-
-            Payment paymentInProcessing = Payment.builder()
-                    .id(PAYMENT_ID).idempotencyKey(IDEMPOTENCY_KEY)
-                    .amount(new BigDecimal("150.00")).currency("USD")
-                    .paymentMethod(PaymentMethod.CARD).status(PaymentStatus.PROCESSING)
-                    .providerId(PROVIDER_A_ID).retryCount(1).version(1L)
-                    .createdAt(LocalDateTime.now()).updatedAt(LocalDateTime.now())
-                    .build();
-
-            when(paymentRepository.findById(PAYMENT_ID)).thenReturn(Optional.of(paymentInProcessing));
-            when(providerBConnector.getProviderId()).thenReturn(PROVIDER_B_ID);
-            when(providerBConnector.processPayment(PAYMENT_ID, new BigDecimal("150.00"), "USD"))
-                    .thenReturn(PROVIDER_B_REF);
-            when(paymentRepository.updateOnSuccess(
-                    eq(PAYMENT_ID), eq(PaymentStatus.SUCCESS),
-                    eq(PROVIDER_B_ID), eq(PROVIDER_B_REF), eq(2), eq(1L)))
-                    .thenReturn(1);
-
-            org.apache.kafka.clients.consumer.ConsumerRecord<String, PaymentEvent> record =
-                    new org.apache.kafka.clients.consumer.ConsumerRecord<>(
-                            MAIN_TOPIC, 0, 0L, PAYMENT_ID,
-                            new PaymentEvent(PAYMENT_ID, new BigDecimal("150.00"), "USD",
-                                    PaymentMethod.CARD, 1, 1L));
-
-            retryConsumer.processPayment(record, MAIN_TOPIC, 2);
-
-            // ProviderA never called on attempt #2 (failover=true → ProviderB)
-            verify(providerAConnector, never()).processPayment(anyString(), any(), anyString());
-            verify(providerBConnector, times(1))
-                    .processPayment(PAYMENT_ID, new BigDecimal("150.00"), "USD");
-            verify(paymentRepository).updateOnSuccess(
-                    PAYMENT_ID, PaymentStatus.SUCCESS, PROVIDER_B_ID, PROVIDER_B_REF, 2, 1L);
-        }
-
-        /**
          * TC-DLT: DLT handler marks payment FAILED in MySQL after all retries exhausted
          */
         @Test
         @DisplayName("TC-DLT: DLT handler marks payment as FAILED with correct version guard")
         void tcDlt_dltHandlerMarksPaymentFailed() {
-            RoutingEngine realRouter = new RoutingEngine(providerAConnector, providerBConnector);
             org.example.kafka.PaymentRetryConsumer retryConsumer =
-                    new org.example.kafka.PaymentRetryConsumer(paymentRepository, realRouter);
+                    new org.example.kafka.PaymentRetryConsumer(paymentRepository, routingEngine);
 
             Payment exhausted = Payment.builder()
                     .id(PAYMENT_ID).idempotencyKey(IDEMPOTENCY_KEY)

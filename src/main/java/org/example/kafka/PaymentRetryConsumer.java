@@ -47,6 +47,9 @@ import java.nio.charset.StandardCharsets;
  *   payment-main-topic-dlt           ← all attempts exhausted
  * </pre>
  *
+ * <p>All retry attempts use the same primary provider determined by the payment method:
+ * CARD → ProviderA, UPI → ProviderB. There is no fallback/failover to an alternate provider.
+ *
  * <h2>retryCount Tracking — The Bug That Was Fixed</h2>
  * <p>Previously {@code retryCount} was calculated as {@code payment.getRetryCount() + 1},
  * reading the value from the database. This was unreliable because:
@@ -192,16 +195,14 @@ public class PaymentRetryConsumer {
             return;
         }
 
-        // ── FAILOVER ROUTING ──────────────────────────────────────────────────────
-        // deliveryAttempt=1 → first delivery → use PRIMARY provider (failover=false)
-        // deliveryAttempt≥2 → retries       → use ALTERNATE provider (failover=true)
-        //   CARD: ProviderA (primary) → ProviderB (failover)
-        //   UPI:  ProviderB (primary) → ProviderA (failover)
-        boolean useFailover = deliveryAttemptValue > 1;
-        PaymentProviderConnector connector = routingEngine.route(event.paymentMethod(), useFailover);
+        // ── PROVIDER ROUTING ──────────────────────────────────────────────────────
+        // Always route to the primary provider for the given payment method.
+        //   CARD → ProviderA
+        //   UPI  → ProviderB
+        PaymentProviderConnector connector = routingEngine.route(event.paymentMethod());
 
-        log.info("Payment [{}] deliveryAttempt={}: routing to provider [{}] (failover={})",
-                event.paymentId(), deliveryAttemptValue, connector.getProviderId(), useFailover);
+        log.info("Payment [{}] deliveryAttempt={}: routing to provider [{}]",
+                event.paymentId(), deliveryAttemptValue, connector.getProviderId());
 
         // ── ATTEMPT PROVIDER CALL ─────────────────────────────────────────────────
         try {

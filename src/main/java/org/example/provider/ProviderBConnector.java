@@ -11,17 +11,12 @@ import java.util.UUID;
 /**
  * ProviderBConnector — simulates integration with Payment Provider B.
  *
- * <p>This connector serves two roles:
- * <ol>
- *   <li><strong>Primary connector</strong> for UPI payment method (selected by RoutingEngine)</li>
- *   <li><strong>Fallback connector</strong> for CARD payments when Provider A has exhausted
- *       its retries — the Kafka consumer's failover strategy switches CARD payments to
- *       Provider B after the first retry attempt fails on Provider A</li>
- * </ol>
+ * <p>This connector is selected by the {@code RoutingEngine} when the payment method
+ * is {@code UPI}.
  *
  * <h2>Failure Simulation</h2>
- * <p>Identical ~20% failure rate to Provider A, ensuring the DLQ path is exercised
- * even when the fallback provider is in play.
+ * <p>Identical ~20% failure rate to Provider A, ensuring the retry infrastructure
+ * is exercised for UPI payments.
  */
 @Slf4j
 @Component

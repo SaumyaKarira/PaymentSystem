@@ -172,14 +172,10 @@ class PaymentConsumerIntegrationTest {
         when(paymentRepository.findById(PAYMENT_ID))
                 .thenReturn(Optional.of(processingPayment(0, 1L)));
 
-        // Both providers always fail — forces all retries to exhaust
+        // Primary provider always fails — forces all retries to exhaust
         when(providerAConnector.getProviderId()).thenReturn(PROVIDER_A_ID);
         when(providerAConnector.processPayment(anyString(), any(), anyString()))
                 .thenThrow(new ProviderException(PROVIDER_A_ID, "504 Gateway Timeout"));
-
-        when(providerBConnector.getProviderId()).thenReturn(PROVIDER_B_ID);
-        when(providerBConnector.processPayment(anyString(), any(), anyString()))
-                .thenThrow(new ProviderException(PROVIDER_B_ID, "500 Internal Server Error"));
 
         when(paymentRepository.updateStatusWithVersionCheck(
                 anyString(), any(PaymentStatus.class), anyInt(), anyLong()))
@@ -194,9 +190,12 @@ class PaymentConsumerIntegrationTest {
                         verify(paymentRepository, atLeast(1)).updateStatusWithVersionCheck(
                                 eq(PAYMENT_ID), eq(PaymentStatus.FAILED), anyInt(), anyLong()));
 
-        // SUCCESS must never have been called — all providers failed
+        // SUCCESS must never have been called — all attempts failed
         verify(paymentRepository, never()).updateOnSuccess(
                 anyString(), any(), anyString(), anyString(), anyInt(), anyLong());
+
+        // ProviderB must never have been called — no failover routing
+        verify(providerBConnector, never()).processPayment(anyString(), any(), anyString());
     }
 
     // =========================================================================

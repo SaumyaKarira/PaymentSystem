@@ -82,17 +82,13 @@ import java.util.UUID;
  *
  * --- Async Kafka path (separate thread) ---
  * 8. PaymentRetryConsumer.processPayment() attempt #1
- *    → routes to primary provider (failover=false)
+ *    → routes to primary provider (CARD → ProviderA, UPI → ProviderB)
  *    → if fails: updateStatusWithVersionCheck(PROCESSING, retryCount=1, version=1)
  *    → throws ProviderException → @RetryableTopic forwards to retry-0 (after 2s)
- * 9. attempt #2 — failover=true → alternate provider
- *    → if succeeds: updateOnSuccess(SUCCESS, version=2) → status=SUCCESS in DB
- *    → if fails: retryCount=2, forwarded to retry-1 (after 4s)
- * 10. attempt #3 → alternate provider
- *    → if fails: forwarded to retry-2 (after 8s)
- * 11. attempt #4 → final attempt
- *    → if fails → DLT handler fires
+ * 9. attempt #2, #3, #4 → same primary provider
+ *    → if final attempt fails → DLT handler fires
  *    → updateStatusWithVersionCheck(FAILED, retryCount=4, version=4) → status=FAILED
+ *    → if any attempt succeeds: updateOnSuccess(SUCCESS, ...) → status=SUCCESS in DB
  * </pre>
  */
 @Slf4j
