@@ -15,12 +15,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.when;
 
-/**
- * RoutingEngineTest — unit tests for {@link RoutingEngine}.
- *
- * <p>Verifies that the routing switch correctly maps each {@link PaymentMethod}
- * to the expected {@link PaymentProviderConnector} implementation.
- */
+// Unit tests for RoutingEngine — verifies CARD → ProviderA and UPI → ProviderB routing.
 @ExtendWith(MockitoExtension.class)
 @DisplayName("RoutingEngine — Unit Tests")
 class RoutingEngineTest {

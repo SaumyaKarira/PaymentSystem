@@ -2,15 +2,7 @@ package org.example.provider;
 
 import org.springframework.stereotype.Component;
 
-/**
- * ProviderAConnector — simulates integration with Payment Provider A.
- *
- * <p>Selected by the {@code RoutingEngine} when the payment method is {@code CARD}.
- *
- * <p>All failure simulation logic (20% failure rate, 504/500 error modes) is inherited
- * from {@link AbstractSimulatedProviderConnector}, keeping this class focused solely on
- * its provider-specific identity.
- */
+// Handles CARD payments via Provider A. Failure simulation inherited from base class.
 @Component
 public class ProviderAConnector extends AbstractSimulatedProviderConnector {
 

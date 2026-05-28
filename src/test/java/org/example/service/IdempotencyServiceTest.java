@@ -31,13 +31,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-/**
- * IdempotencyServiceTest — unit tests for {@link IdempotencyService}.
- *
- * <p>All Redis interactions are mocked using Mockito, so no real Redis connection
- * is required. The ObjectMapper is a real instance configured identically to how
- * {@code RedisConfig.redisObjectMapper()} creates it in production.
- */
+// Unit tests for IdempotencyService.
+// All Redis interactions are mocked with Mockito; ObjectMapper is a real instance matching production config.
 @ExtendWith(MockitoExtension.class)
 @DisplayName("IdempotencyService — Unit Tests")
 class IdempotencyServiceTest {
@@ -64,9 +59,7 @@ class IdempotencyServiceTest {
 
         idempotencyService = new IdempotencyService(redisTemplate, objectMapper);
         ReflectionTestUtils.setField(idempotencyService, "ttlSeconds", TTL);
-        // NOTE: opsForValue() stub is NOT set here globally because releaseKey() and
-        // exists() never call opsForValue(), which would cause UnnecessaryStubbingException
-        // in Mockito strict mode. Each nested class that needs it sets up the stub locally.
+        // opsForValue() is stubbed per nested class only where needed to avoid UnnecessaryStubbingException
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────

@@ -34,17 +34,9 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-/**
- * PaymentRetryConsumerTest — direct unit tests for {@link PaymentRetryConsumer}.
- *
- * <p>Tests invoke {@code processPayment()} and {@code handleDlt()} directly without
- * any Kafka broker. All dependencies are Mockito mocks. Spring Kafka header injection
- * is simulated by passing the {@code deliveryAttempt} parameter directly.
- *
- * <p>This class covers the core logic paths of the consumer in fast, isolated unit tests.
- * End-to-end Kafka routing and retry-topic forwarding are covered separately in
- * {@link PaymentConsumerIntegrationTest}.
- */
+// Unit tests for PaymentRetryConsumer — no Kafka broker required, all deps are mocks.
+// deliveryAttempt header is simulated by passing the value directly.
+// End-to-end Kafka retry routing is covered in PaymentConsumerIntegrationTest.
 @ExtendWith(MockitoExtension.class)
 @DisplayName("PaymentRetryConsumer — Unit Tests")
 class PaymentRetryConsumerTest {

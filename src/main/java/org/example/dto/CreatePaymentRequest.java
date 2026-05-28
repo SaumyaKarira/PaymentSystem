@@ -8,20 +8,8 @@ import org.example.entity.PaymentMethod;
 
 import java.math.BigDecimal;
 
-/**
- * CreatePaymentRequest — incoming DTO for the {@code POST /v1/payments} endpoint.
- *
- * <p>Bean Validation annotations enforce contract correctness before the request
- * reaches the service layer. Violations are caught by {@code GlobalExceptionHandler}
- * and returned as structured 400 Bad Request responses.
- *
- * <p>Uses a Java record (Java 16+) for conciseness — records are immutable by design,
- * which is exactly what we want for an inbound request DTO.
- *
- * @param amount        monetary value; must be greater than zero
- * @param currency      ISO 4217 currency code (2–10 characters)
- * @param paymentMethod the payment instrument (CARD or UPI)
- */
+// Incoming DTO for POST /v1/payments.
+// Bean Validation annotations enforce contract correctness; violations return 400 via GlobalExceptionHandler.
 public record CreatePaymentRequest(
 
         @NotNull(message = "amount must not be null")
@@ -36,4 +24,3 @@ public record CreatePaymentRequest(
         PaymentMethod paymentMethod
 
 ) {}
-

@@ -46,24 +46,9 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-/**
- * PaymentConsumerIntegrationTest — full integration tests for the Kafka retry pipeline.
- *
- * <h2>Infrastructure</h2>
- * <ul>
- *   <li>{@code @EmbeddedKafka} — in-process Kafka broker, no external Kafka needed</li>
- *   <li>{@code @MockBean} for all DB/Redis dependencies — no MySQL or Redis needed</li>
- *   <li>{@code @SpringBootTest(webEnvironment=NONE)} — full context minus HTTP server</li>
- * </ul>
- *
- * <h2>@DirtiesContext</h2>
- * <p>Forces a fresh Spring context after each test method. This prevents the Kafka
- * consumer from seeing uncommitted offsets from a previous test's published messages.
- *
- * <h2>@TestPropertySource</h2>
- * <p>Points Kafka bootstrap-servers at the embedded broker's dynamically assigned port.
- * Also disables JPA/Redis auto-configuration since all those dependencies are @MockBean.
- */
+// Integration tests for the Kafka retry pipeline.
+// Uses @EmbeddedKafka (no external Kafka) and @MockBean for all DB/Redis deps (no MySQL/Redis needed).
+// @DirtiesContext resets the context after each test to prevent offset leakage between tests.
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
 @EmbeddedKafka(
         partitions = 1,

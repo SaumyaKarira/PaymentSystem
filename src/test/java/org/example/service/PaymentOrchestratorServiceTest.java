@@ -40,16 +40,8 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-/**
- * PaymentOrchestratorServiceTest — unit tests for the core orchestration layer.
- *
- * <p>All external dependencies are mocked with Mockito. The service under test is
- * constructed manually so we control every collaborator precisely.
- *
- * <p>Why NOT @InjectMocks: PaymentOrchestratorService's constructor now takes exactly
- * 4 args (PaymentRepository, IdempotencyService, RoutingEngine, KafkaTemplate).
- * We construct it explicitly below so there is no ambiguity about which mock goes where.
- */
+// Unit tests for the core orchestration layer.
+// All dependencies are mocked with Mockito. Service constructed manually to avoid @InjectMocks ambiguity.
 @ExtendWith(MockitoExtension.class)
 @DisplayName("PaymentOrchestratorService — Unit Tests")
 class PaymentOrchestratorServiceTest {
@@ -92,10 +84,7 @@ class PaymentOrchestratorServiceTest {
         return new CreatePaymentRequest(new BigDecimal("500.00"), "INR", PaymentMethod.UPI);
     }
 
-    /**
-     * Simulates the Payment entity returned by paymentRepository.save().
-     * version=0L because it is a fresh INSERT — Hibernate sets it to 0.
-     */
+    // Simulates the Payment entity returned by paymentRepository.save() with version=0 (fresh INSERT)
     private Payment savedInitiatedPayment(PaymentMethod method) {
         return Payment.builder()
                 .id(PAYMENT_ID)
@@ -152,9 +141,7 @@ class PaymentOrchestratorServiceTest {
     @DisplayName("Category A — Happy Path Scenarios")
     class HappyPathTests {
 
-        /**
-         * CARD payment → ProviderA succeeds → MySQL SUCCESS → 201
-         */
+        // CARD payment → ProviderA succeeds → MySQL SUCCESS → response returned
         @Test
         @DisplayName("CARD routes to ProviderA, succeeds, returns SUCCESS response")
         void cardPaymentSuccessViaProviderA() {
@@ -190,9 +177,7 @@ class PaymentOrchestratorServiceTest {
             assertThat(cacheCaptor.getValue().status()).isEqualTo(PaymentStatus.SUCCESS);
         }
 
-        /**
-         * UPI payment → ProviderB succeeds → ProviderA never called
-         */
+        // UPI payment → ProviderB succeeds → ProviderA never called
         @Test
         @DisplayName("UPI routes to ProviderB, succeeds, ProviderA never called")
         void upiPaymentSuccessViaProviderB() {
@@ -219,9 +204,7 @@ class PaymentOrchestratorServiceTest {
             verify(kafkaTemplate, never()).send(anyString(), anyString(), any(PaymentEvent.class));
         }
 
-        /**
-         * GET payment fetches real-time MySQL state
-         */
+        // GET payment fetches real-time MySQL state
         @Test
         @DisplayName("GET payment returns real-time status, retryCount, version from MySQL")
         void getPaymentFetchesRealTimeState() {
@@ -245,9 +228,7 @@ class PaymentOrchestratorServiceTest {
             verify(idempotencyService, never()).getCachedResponse(anyString());
         }
 
-        /**
-         * Duplicate request with completed key → returns cached response, zero processing
-         */
+        // Duplicate request with completed key → returns cached response, zero processing
         @Test
         @DisplayName("Idempotency cache hit returns cached response without any DB/provider calls")
         void idempotencyCacheHitBypassesAllLayers() {
@@ -276,9 +257,7 @@ class PaymentOrchestratorServiceTest {
     @DisplayName("Category B — Negative and Error Boundary Scenarios")
     class NegativeTests {
 
-        /**
-         * In-flight lock not acquired, no cached response → IdempotencyConflictException
-         */
+        // In-flight lock not acquired, no cached response → IdempotencyConflictException
         @Test
         @DisplayName("In-flight key with no cached value throws IdempotencyConflictException")
         void inFlightKeyThrowsConflict() {
@@ -293,9 +272,7 @@ class PaymentOrchestratorServiceTest {
             verify(kafkaTemplate, never()).send(anyString(), anyString(), any(PaymentEvent.class));
         }
 
-        /**
-         * GET with non-existent ID throws PaymentNotFoundException
-         */
+        // GET with non-existent ID throws PaymentNotFoundException
         @Test
         @DisplayName("TC-08: GET with unknown UUID throws PaymentNotFoundException")
         void unknownIdThrowsNotFoundException() {
@@ -307,9 +284,7 @@ class PaymentOrchestratorServiceTest {
                     .hasMessageContaining(unknownId);
         }
 
-        /**
-         * Redis outage propagates exception and releases key
-         */
+        // Redis outage propagates exception and releases key
         @Test
         @DisplayName("Redis connection failure propagates exception without touching DB")
         void redisOutagePropagatesException() {
@@ -331,10 +306,7 @@ class PaymentOrchestratorServiceTest {
     @DisplayName("Category C — Resiliency and Kafka Hand-Off")
     class ResiliencyTests {
 
-        /**
-         *  Provider throws 504 → status transitions to PROCESSING →
-         * event published to Kafka → client receives PROCESSING response immediately
-         */
+        // Provider throws 504 → PROCESSING in MySQL → event on Kafka → client gets PROCESSING immediately
         @Test
         @DisplayName("Provider 504 → PROCESSING in MySQL → event on Kafka → 201 PROCESSING")
         void providerFailureTransitionsToProcessingAndPublishesToKafka() {
@@ -378,9 +350,7 @@ class PaymentOrchestratorServiceTest {
                     .updateOnSuccess(anyString(), any(), anyString(), anyString(), anyInt(), anyLong());
         }
 
-        /**
-         * DLT handler marks payment FAILED in MySQL after all retries exhausted
-         */
+        // DLT handler marks payment FAILED in MySQL after all retries exhausted
         @Test
         @DisplayName("DLT handler marks payment as FAILED with correct version guard")
         void dltHandlerMarksPaymentFailed() {

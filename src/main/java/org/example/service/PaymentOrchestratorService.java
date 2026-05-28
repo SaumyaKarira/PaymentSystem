@@ -19,78 +19,9 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.UUID;
 
-/**
- * PaymentOrchestratorService — core orchestration for the payment lifecycle.
- *
- * <h2>The @Transactional Proxy Problem — Why Internal Calls Don't Work</h2>
- * <p>Spring's {@code @Transactional} works via a JDK/CGLIB proxy. When you call a
- * {@code @Transactional} method from OUTSIDE the bean (through the proxy), Spring
- * intercepts the call and wraps it in a transaction. But when a method inside the
- * same class calls another method in the same class using {@code this.method()},
- * it bypasses the proxy entirely — the transaction annotation is silently ignored.
- *
- * <p>The previous implementation had {@code protected @Transactional} methods like
- * {@code persistNewPayment()}, {@code updatePaymentOnSuccess()}, etc., which were
- * all called via {@code this.} — meaning their {@code @Transactional} annotations
- * NEVER fired. When the JPQL {@code @Modifying} queries then ran with no active
- * transaction, JPA threw:
- * <pre>
- *   TransactionRequiredException: Executing an update/delete query
- * </pre>
- *
- * <h2>The Fix Applied Here</h2>
- * <p>The fix is two-part:
- * <ol>
- *   <li><strong>Repository level</strong>: {@code @Transactional} is added directly
- *       on the {@code @Modifying} methods in {@code PaymentRepository}. This is the
- *       correct place — it guarantees a transaction at the repository boundary
- *       regardless of what the caller does, since the repository IS a Spring-proxied
- *       interface bean and its methods are always called through the proxy.</li>
- *   <li><strong>Service level</strong>: The internal helper methods that were
- *       {@code protected @Transactional} are inlined directly into the public method
- *       flow, removing the dead same-class transaction annotations. The service
- *       methods that ARE public and called from outside (like {@code getPayment()})
- *       retain their {@code @Transactional} annotation correctly.</li>
- * </ol>
- *
- * <h2>Payment State Transition Flow</h2>
- *
- * <h3>Happy Path (80% — synchronous SUCCESS)</h3>
- * <pre>
- * 1. Redis SET NX "idempotency:K" IN_FLIGHT  → lock acquired
- * 2. INSERT payments (status=INITIATED, version=0)  → committed immediately
- * 3. ProviderConnector.processPayment()  → returns providerRefId
- * 4. paymentRepository.updateOnSuccess()  — @Transactional on the repository method
- *    → UPDATE payments SET status=SUCCESS, version=1 WHERE id=? AND version=0
- * 5. paymentRepository.findById()  → returns fresh entity (cache cleared by clearAutomatically=true)
- * 6. Redis SET "idempotency:K" {PaymentResponse}  → cached for 24h
- * 7. Return 201 {status: SUCCESS}
- * </pre>
- *
- * <h3>Failure Path (20% — async Kafka retry → SUCCESS or FAILED)</h3>
- * <pre>
- * 1. Redis SET NX → lock acquired
- * 2. INSERT payments (status=INITIATED, version=0) → committed
- * 3. ProviderConnector.processPayment() → THROWS ProviderException (504/500)
- * 4. paymentRepository.updateStatusWithVersionCheck(PROCESSING, retryCount=0, version=0)
- *    → UPDATE payments SET status=PROCESSING, version=1 WHERE id=? AND version=0
- *    → @Transactional on repository method ensures this commits
- * 5. kafkaTemplate.send("payment-main-topic", paymentId, event)
- *    → message published; client thread released immediately (non-blocking)
- * 6. Redis SET "idempotency:K" {status: PROCESSING} → cached
- * 7. Return 201 {status: PROCESSING}
- *
- * --- Async Kafka path (separate thread) ---
- * 8. PaymentRetryConsumer.processPayment() attempt #1
- *    → routes to primary provider (CARD → ProviderA, UPI → ProviderB)
- *    → if fails: updateStatusWithVersionCheck(PROCESSING, retryCount=1, version=1)
- *    → throws ProviderException → @RetryableTopic forwards to retry-0 (after 2s)
- * 9. attempt #2, #3, #4 → same primary provider
- *    → if final attempt fails → DLT handler fires
- *    → updateStatusWithVersionCheck(FAILED, retryCount=4, version=4) → status=FAILED
- *    → if any attempt succeeds: updateOnSuccess(SUCCESS, ...) → status=SUCCESS in DB
- * </pre>
- */
+// Orchestrates the full payment lifecycle: idempotency check → DB persist → provider call → Kafka publish.
+// @Transactional annotations are placed on PaymentRepository methods (not here) to avoid the
+// Spring proxy self-invocation problem where internal this.method() calls bypass the proxy.
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -104,17 +35,8 @@ public class PaymentOrchestratorService {
     @Value("${payment.kafka.main-topic:payment-main-topic}")
     private String mainTopic;
 
-    /**
-     * Creates a new payment and orchestrates the full synchronous processing flow.
-     *
-     * <p><strong>Transaction design:</strong> This method is NOT annotated with
-     * {@code @Transactional} because it spans multiple non-DB operations (Redis lock,
-     * external provider HTTP call, Kafka publish). Wrapping all of this in a single DB
-     * transaction would hold a connection open during the provider call — wasteful and
-     * risky. Instead, each DB operation delegates to the repository which carries its
-     * own {@code @Transactional} annotation, ensuring each write is committed
-     * independently and promptly.
-     */
+    // Not @Transactional — spans Redis, provider HTTP call, and Kafka publish.
+    // Each DB write is handled by repository-level @Transactional instead.
     public PaymentResponse createPayment(CreatePaymentRequest request, String idempotencyKey) {
 
         // ── STEP 1: ACQUIRE REDIS IN-FLIGHT LOCK ─────────────────────────────
@@ -256,13 +178,7 @@ public class PaymentOrchestratorService {
         }
     }
 
-    /**
-     * Fetches a payment by UUID from MySQL — always reads live data, never Redis.
-     *
-     * <p>{@code @Transactional(readOnly = true)} tells the JPA provider to use a
-     * read-only transaction — no dirty checking, no flush, which gives a small
-     * performance benefit for SELECT-only operations.
-     */
+    // Fetches live payment state from MySQL — readOnly=true skips dirty checking for a slight perf gain.
     @Transactional(readOnly = true)
     public PaymentResponse getPayment(String paymentId) {
         Payment payment = paymentRepository.findById(paymentId)

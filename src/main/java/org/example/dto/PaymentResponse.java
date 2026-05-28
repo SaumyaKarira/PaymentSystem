@@ -8,29 +8,9 @@ import org.example.entity.PaymentStatus;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
-/**
- * PaymentResponse — outbound DTO returned by both the POST and GET endpoints.
- *
- * <p>{@code @JsonInclude(NON_NULL)} suppresses null fields from the JSON response body,
- * keeping the response clean when optional fields (e.g., {@code providerReferenceId})
- * have not yet been populated.
- *
- * <p>This is a Java record — immutable, compact, and avoids Lombok on the DTO layer.
- * The static factory method {@link #from(Payment)} encapsulates entity-to-DTO mapping,
- * keeping the service layer free of Jackson or DTO concerns.
- *
- * @param id                    payment UUID
- * @param idempotencyKey        the key used to deduplicate this request
- * @param amount                monetary amount
- * @param currency              ISO 4217 currency code
- * @param paymentMethod         CARD or UPI
- * @param status                current lifecycle status
- * @param providerId            which provider connector handled this payment
- * @param providerReferenceId   provider's own transaction reference ID
- * @param retryCount            number of retry attempts made via Kafka
- * @param createdAt             record creation timestamp
- * @param updatedAt             last update timestamp
- */
+// Outbound DTO returned by both POST and GET payment endpoints.
+// @JsonInclude(NON_NULL) suppresses null fields (e.g., providerReferenceId before a provider succeeds).
+// from() maps a Payment entity to this DTO, keeping entity-to-DTO logic in one place.
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record PaymentResponse(
         String id,
@@ -46,16 +26,7 @@ public record PaymentResponse(
         LocalDateTime updatedAt
 ) {
 
-    /**
-     * Maps a {@link Payment} JPA entity to a {@link PaymentResponse} DTO.
-     *
-     * <p>Keeping the mapping logic here (on the DTO) follows the principle of
-     * co-locating the DTO's construction logic with the DTO itself, rather than
-     * scattering it across service classes.
-     *
-     * @param payment the entity to convert
-     * @return a fully populated response DTO
-     */
+    // Maps a Payment entity to a PaymentResponse DTO
     public static PaymentResponse from(Payment payment) {
         return new PaymentResponse(
                 payment.getId(),
@@ -72,4 +43,3 @@ public record PaymentResponse(
         );
     }
 }
-

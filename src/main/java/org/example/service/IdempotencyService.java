@@ -13,23 +13,9 @@ import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
-/**
- * IdempotencyService — manages idempotency key lifecycle in local Redis.
- *
- * <h2>Storage Strategy</h2>
- * <p>All values in Redis are stored as plain UTF-8 JSON strings:
- * <ul>
- *   <li>While processing:  key → {@code "IN_FLIGHT"}</li>
- *   <li>After completion:  key → {@code "{\"id\":\"...\",\"status\":\"SUCCESS\",...}"}</li>
- * </ul>
- *
- * <p>Using plain strings avoids all Jackson polymorphic type-embedding issues.
- * {@code PaymentResponse} is a Java {@code record} (implicitly {@code final}), which
- * was excluded from type metadata when using {@code NON_FINAL} typing — causing the
- * {@code SerializationException: missing type id property '@class'} on deserialization.
- * Storing as a raw JSON string and deserializing with an explicit target type completely
- * sidesteps this problem.
- */
+// Manages idempotency key lifecycle in Redis.
+// While processing: key → "IN_FLIGHT"
+// After completion: key → serialized PaymentResponse JSON string
 @Slf4j
 @Service
 public class IdempotencyService {
@@ -40,18 +26,10 @@ public class IdempotencyService {
     @Value("${payment.idempotency.ttl-seconds:86400}")
     private long ttlSeconds;
 
-    /**
-     * RedisTemplate typed to {@code <String, String>} — both keys and values are
-     * plain strings. Injected from {@code RedisConfig.redisTemplate()}.
-     */
+    // RedisTemplate with String keys and String values
     private final RedisTemplate<String, String> redisTemplate;
 
-    /**
-     * Shared ObjectMapper for serializing {@code PaymentResponse} to JSON string
-     * before storing in Redis, and deserializing back on read.
-     * Uses the {@code redisObjectMapper} bean from {@code RedisConfig} which has
-     * {@code JavaTimeModule} configured so dates are ISO-8601 strings, not arrays.
-     */
+    // ObjectMapper shared with the filter for consistent JSON serialization of PaymentResponse
     private final ObjectMapper objectMapper;
 
     public IdempotencyService(
@@ -61,15 +39,7 @@ public class IdempotencyService {
         this.objectMapper = objectMapper;
     }
 
-    /**
-     * Attempts to acquire an in-flight lock for the given idempotency key.
-     *
-     * <p>Uses Redis {@code SET key value NX PX ttl} (atomic — only sets if key absent).
-     * Only one concurrent request can win this lock for a given key. All others get false.
-     *
-     * @param idempotencyKey the raw idempotency key from the request header
-     * @return {@code true} if the lock was acquired; {@code false} if already held
-     */
+    // Acquires an in-flight lock via Redis SET NX. Returns true if the lock was acquired.
     public boolean acquireInFlightLock(String idempotencyKey) {
         String redisKey = KEY_PREFIX + idempotencyKey;
         Boolean acquired = redisTemplate.opsForValue()
@@ -79,91 +49,52 @@ public class IdempotencyService {
         return result;
     }
 
-    /**
-     * Returns {@code true} if the key exists in Redis with value {@code "IN_FLIGHT"}.
-     * Used by the filter to short-circuit concurrent duplicate requests with 409.
-     *
-     * @param idempotencyKey the raw idempotency key
-     * @return true if currently in-flight
-     */
+    // Returns true if the key exists in Redis with value "IN_FLIGHT".
     public boolean isInFlight(String idempotencyKey) {
         String value = redisTemplate.opsForValue().get(KEY_PREFIX + idempotencyKey);
         return IN_FLIGHT_VALUE.equals(value);
     }
 
-    /**
-     * Serializes the completed {@link PaymentResponse} to a JSON string and stores it
-     * in Redis, overwriting the {@code IN_FLIGHT} sentinel.
-     *
-     * <p>After this call, any duplicate request arriving at the filter will find this
-     * JSON string, deserialize it back to {@code PaymentResponse}, and return it to
-     * the client — with zero DB, provider, or Kafka involvement.
-     *
-     * @param idempotencyKey  the raw idempotency key
-     * @param paymentResponse the completed payment response to cache
-     */
+    // Serializes the completed PaymentResponse to JSON and stores it in Redis, replacing IN_FLIGHT.
     public void storeCompletedResponse(String idempotencyKey, PaymentResponse paymentResponse) {
         try {
-            // Serialize PaymentResponse → plain JSON string.
-            // Example: {"id":"abc","status":"SUCCESS","amount":150.00,...}
             String json = objectMapper.writeValueAsString(paymentResponse);
             redisTemplate.opsForValue().set(KEY_PREFIX + idempotencyKey, json, ttlSeconds, TimeUnit.SECONDS);
             log.debug("Stored completed response in Redis for key [{}]", idempotencyKey);
         } catch (JsonProcessingException e) {
-            // This should never happen for a well-formed PaymentResponse record.
-            // Log and continue — worst case the next duplicate request re-processes normally.
+            // Shouldn't happen for a well-formed PaymentResponse — log and continue.
             log.error("Failed to serialize PaymentResponse to JSON for key [{}]: {}",
                     idempotencyKey, e.getMessage());
         }
     }
 
-    /**
-     * Reads the cached JSON string from Redis and deserializes it back to
-     * {@link PaymentResponse}. Returns empty if the key is absent or still IN_FLIGHT.
-     *
-     * @param idempotencyKey the raw idempotency key
-     * @return Optional containing the cached response, or empty
-     */
+    // Reads cached JSON from Redis and deserializes it. Returns empty if absent or still IN_FLIGHT.
     public Optional<PaymentResponse> getCachedResponse(String idempotencyKey) {
         String value = redisTemplate.opsForValue().get(KEY_PREFIX + idempotencyKey);
 
-        // Key absent or still IN_FLIGHT — not a completed response
         if (value == null || IN_FLIGHT_VALUE.equals(value)) {
             return Optional.empty();
         }
 
         try {
-            // Deserialize the JSON string back to PaymentResponse using the same ObjectMapper
-            // that was used to serialize it — guaranteed format consistency.
             PaymentResponse response = objectMapper.readValue(value, PaymentResponse.class);
             log.debug("Cache hit for idempotency key [{}]", idempotencyKey);
             return Optional.of(response);
         } catch (JsonProcessingException e) {
-            // Corrupted or unexpected value in Redis — treat as cache miss and reprocess.
-            log.error("Failed to deserialize cached PaymentResponse for key [{}]: {}. "
-                    + "Treating as cache miss.", idempotencyKey, e.getMessage());
+            // Corrupted value in Redis — treat as cache miss.
+            log.error("Failed to deserialize cached PaymentResponse for key [{}]: {}. Treating as cache miss.",
+                    idempotencyKey, e.getMessage());
             return Optional.empty();
         }
     }
 
-    /**
-     * Deletes the idempotency key from Redis entirely.
-     * Called when an unexpected error occurs during payment creation so the client
-     * can safely retry after the error is resolved (key won't stay as IN_FLIGHT).
-     *
-     * @param idempotencyKey the raw idempotency key to remove
-     */
+    // Deletes the idempotency key from Redis so the client can safely retry.
     public void releaseKey(String idempotencyKey) {
         redisTemplate.delete(KEY_PREFIX + idempotencyKey);
         log.debug("Released idempotency key [{}] from Redis", idempotencyKey);
     }
 
-    /**
-     * Returns {@code true} if any entry (IN_FLIGHT or completed) exists for the key.
-     *
-     * @param idempotencyKey the raw idempotency key
-     * @return true if the key exists in Redis
-     */
+    // Returns true if any entry (IN_FLIGHT or completed) exists for the key.
     public boolean exists(String idempotencyKey) {
         return Boolean.TRUE.equals(redisTemplate.hasKey(KEY_PREFIX + idempotencyKey));
     }

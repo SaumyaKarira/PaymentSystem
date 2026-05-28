@@ -41,31 +41,9 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-/**
- * IdempotencyFilterTest — standalone MockMvc tests for {@link IdempotencyFilter}.
- *
- * <h2>Why standaloneSetup instead of @WebMvcTest</h2>
- * <p>{@code @WebMvcTest} loads a partial Spring context. When {@code IdempotencyFilter}
- * (which requires a {@code redisObjectMapper} bean) is added via {@code @Import}, its
- * constructor injection may fail silently during context initialization, causing the
- * {@code DispatcherServlet} to not register controller routes — every request then falls
- * through to Spring's static resource handler and returns {@code NoResourceFoundException}.
- *
- * <p>{@code MockMvcBuilders.standaloneSetup(controller)} avoids this by building MockMvc
- * directly from the controller instance — no Spring context, no auto-configuration, no
- * bean wiring surprises. The filter is constructed manually with its mocked dependencies
- * and added via {@code .addFilters(filter)}, giving us full control over the filter chain.
- *
- * <h2>Test Infrastructure</h2>
- * <ul>
- *   <li>{@link MockitoExtension} — provides {@code @Mock} field injection without Spring</li>
- *   <li>{@link MockMvcBuilders#standaloneSetup} — registers the controller and filter chain</li>
- *   <li>{@link GlobalExceptionHandler} — added via {@code .setControllerAdvice()} so all
- *       exception-to-HTTP mappings work exactly as in production</li>
- *   <li>A shared {@link ObjectMapper} with {@code JavaTimeModule} is passed to both the
- *       filter and the HTTP message converter, guaranteeing consistent JSON serialization</li>
- * </ul>
- */
+// Standalone MockMvc tests for IdempotencyFilter.
+// Uses standaloneSetup (not @WebMvcTest) to avoid Spring context issues with the filter's bean wiring.
+// Filter is constructed manually with mocked dependencies and added via .addFilters().
 @ExtendWith(MockitoExtension.class)
 @DisplayName("IdempotencyFilter — Standalone MockMvc Tests")
 class IdempotencyFilterTest {
@@ -94,34 +72,16 @@ class IdempotencyFilterTest {
 
     @BeforeEach
     void setUp() {
-        // ── ObjectMapper: shared between filter and HTTP message converter ────
-        // JavaTimeModule ensures LocalDateTime is serialized as an ISO-8601 string
-        // ("2026-05-28T10:30:00") rather than a numeric array ([2026,5,28,...]).
-        // Both the filter's writeCachedResponse() and the controller's JSON responses
-        // must use the SAME mapper configuration for consistent serialization.
+        // JavaTimeModule: LocalDateTime serialized as ISO-8601 string, not a numeric array
         objectMapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
-        // ── IdempotencyFilter: manually constructed with mocked dependencies ──
-        // This bypasses Spring's bean wiring entirely. The filter gets real logic
-        // (it's the real IdempotencyFilter class) but its collaborators are Mockito mocks.
+        // Filter and controller are real instances with mocked collaborators
         IdempotencyFilter filter = new IdempotencyFilter(idempotencyService, objectMapper);
-
-        // ── PaymentController: real instance with a mocked service ────────────
         PaymentController controller = new PaymentController(paymentOrchestratorService);
 
-        // ── MockMvc: standalone setup wiring controller + filter + advice ─────
-        // standaloneSetup() registers the controller's @RequestMapping routes with the
-        // DispatcherServlet WITHOUT needing a Spring ApplicationContext. Routes are
-        // discovered via reflection from the controller instance — 100% reliable.
-        //
-        // .addFilters(filter)          → inserts IdempotencyFilter into the filter chain
-        //                                before the DispatcherServlet, exactly as in prod
-        // .setControllerAdvice(...)    → registers GlobalExceptionHandler so @ExceptionHandler
-        //                                methods produce proper JSON error responses
-        // .setMessageConverters(...)   → installs the configured ObjectMapper so LocalDateTime
-        //                                fields serialize as ISO-8601 strings in error responses
+        // standaloneSetup: wires controller + filter + exception handler without a Spring context
         mockMvc = MockMvcBuilders
                 .standaloneSetup(controller)
                 .addFilters(filter)
@@ -156,13 +116,7 @@ class IdempotencyFilterTest {
     @DisplayName("Category A — Filter Pass-Through Scenarios")
     class FilterPassThroughTests {
 
-        /**
-         * TC-01: A valid POST with a fresh Idempotency-Key (not in-flight, not cached)
-         * must pass all filter checks, reach the controller, and return HTTP 201.
-         *
-         * <p>Flow: filter checks isInFlight → false → getCachedResponse → empty
-         * → filterChain.doFilter() → controller.createPayment() → 201
-         */
+        // Fresh key, not in-flight, not cached — request passes through to controller → 201
         @Test
         @DisplayName("Valid POST with new Idempotency-Key passes filter → HTTP 201 Created")
         void validPostPassesThroughFilter() throws Exception {
@@ -185,11 +139,7 @@ class IdempotencyFilterTest {
             verify(paymentOrchestratorService).createPayment(any(), anyString());
         }
 
-        /**
-         * TC-02: GET requests must bypass IdempotencyFilter — the filter's scope check
-         * ({@code !"POST".equalsIgnoreCase(method)}) calls filterChain.doFilter() immediately.
-         * No idempotency checks are performed.
-         */
+        // GET bypasses the filter entirely — no idempotency checks performed
         @Test
         @DisplayName("GET requests bypass IdempotencyFilter — no idempotency checks performed")
         void getRequestsBypassFilter() throws Exception {
@@ -214,10 +164,7 @@ class IdempotencyFilterTest {
     @DisplayName("Category B — Filter Rejection Scenarios")
     class FilterRejectionTests {
 
-        /**
-         * TC-03A: POST without an Idempotency-Key header — filter writes 400 directly
-         * to the response and returns. The controller is never reached.
-         */
+        // Missing Idempotency-Key header → filter rejects with 400, controller not reached
         @Test
         @DisplayName("Missing Idempotency-Key header → HTTP 400 Bad Request")
         void missingIdempotencyKeyHeader_returns400() throws Exception {
@@ -231,10 +178,7 @@ class IdempotencyFilterTest {
                     .createPayment(any(CreatePaymentRequest.class), anyString());
         }
 
-        /**
-         * TC-03B: Whitespace-only Idempotency-Key — {@code isBlank()} returns true,
-         * filter rejects with 400 before reaching the controller.
-         */
+        // Whitespace-only key → isBlank() true → filter rejects with 400
         @Test
         @DisplayName("Blank Idempotency-Key header → HTTP 400 Bad Request")
         void blankIdempotencyKeyHeader_returns400() throws Exception {
@@ -248,11 +192,7 @@ class IdempotencyFilterTest {
                     .createPayment(any(CreatePaymentRequest.class), anyString());
         }
 
-        /**
-         * TC-03C: Header is valid so the filter passes the request through, but a
-         * negative amount fails {@code @Valid} Bean Validation in the controller.
-         * {@code GlobalExceptionHandler} returns 400 with a {@code fieldErrors} array.
-         */
+        // Valid header passes filter but negative amount fails @Valid → 400 with fieldErrors
         @Test
         @DisplayName("Negative amount fails Bean Validation → HTTP 400 with fieldErrors")
         void negativeAmount_returns400WithFieldErrors() throws Exception {
@@ -275,10 +215,7 @@ class IdempotencyFilterTest {
                     .createPayment(any(CreatePaymentRequest.class), anyString());
         }
 
-        /**
-         * TC-03D: Invalid enum value — Jackson throws {@code HttpMessageNotReadableException},
-         * mapped to 400 by {@code GlobalExceptionHandler.handleMalformedBody()}.
-         */
+        // Invalid enum value → Jackson HttpMessageNotReadableException → 400
         @Test
         @DisplayName("Invalid paymentMethod enum value → HTTP 400 Bad Request")
         void invalidPaymentMethodEnum_returns400() throws Exception {
@@ -299,10 +236,7 @@ class IdempotencyFilterTest {
                     .createPayment(any(CreatePaymentRequest.class), anyString());
         }
 
-        /**
-         * TC-03E: Missing {@code currency} field fails Bean Validation.
-         * The {@code fieldErrors} array must contain an entry for the {@code currency} field.
-         */
+        // Missing currency field fails @Valid → 400 with currency in fieldErrors
         @Test
         @DisplayName("Null currency fails Bean Validation → HTTP 400 with currency field error")
         void nullCurrency_returns400WithCurrencyFieldError() throws Exception {
@@ -325,13 +259,7 @@ class IdempotencyFilterTest {
                     .createPayment(any(CreatePaymentRequest.class), anyString());
         }
 
-        /**
-         * TC-05: In-flight Idempotency-Key → HTTP 409 Conflict.
-         *
-         * <p>When {@code isInFlight(key)} returns {@code true}, the filter writes a 409
-         * directly and returns. Both the controller and {@code getCachedResponse()} are
-         * never invoked.
-         */
+        // In-flight key → filter short-circuits with 409, getCachedResponse never called
         @Test
         @DisplayName("In-flight Idempotency-Key → HTTP 409 Conflict, controller not reached")
         void inFlightKey_returns409Conflict() throws Exception {
@@ -350,13 +278,7 @@ class IdempotencyFilterTest {
             verify(idempotencyService, never()).getCachedResponse(anyString());
         }
 
-        /**
-         * TC-04: Redis cache hit → HTTP 200 OK with cached body, controller bypassed.
-         *
-         * <p>When {@code getCachedResponse(key)} returns a non-empty Optional, the filter
-         * serializes the {@link PaymentResponse} to the HTTP response (status 200) and
-         * returns without calling {@code filterChain.doFilter()}.
-         */
+        // Cache hit → filter returns 200 with cached body, controller bypassed
         @Test
         @DisplayName("Redis cache hit → HTTP 200 with cached body, controller bypassed")
         void cacheHit_returns200WithCachedBody() throws Exception {
@@ -396,10 +318,7 @@ class IdempotencyFilterTest {
     @DisplayName("Category C — GlobalExceptionHandler Error Mapping")
     class GlobalExceptionHandlerTests {
 
-        /**
-         * TC-08: GET with an unknown payment ID — service throws
-         * {@link PaymentNotFoundException}, mapped to HTTP 404 with a structured JSON body.
-         */
+        // Unknown payment ID → service throws PaymentNotFoundException → 404
         @Test
         @DisplayName("GET with unknown payment ID → HTTP 404 structured response")
         void unknownPaymentId_returns404() throws Exception {
@@ -414,11 +333,7 @@ class IdempotencyFilterTest {
                     .andExpect(jsonPath("$.message", containsString(unknownId)));
         }
 
-        /**
-         * TC-09: Error response {@code timestamp} must be an ISO-8601 string — not a
-         * numeric array — validating that {@code JavaTimeModule} is configured correctly
-         * on the shared {@code ObjectMapper} used by the message converter.
-         */
+        // Error response timestamp must be ISO-8601 string, not a numeric array
         @Test
         @DisplayName("Error response timestamp")
         void errorResponseTimestamp_isIso8601String() throws Exception {
