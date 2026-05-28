@@ -5,9 +5,7 @@
 -- =============================================================================
 
 -- Create the database if it doesn't already exist (safe for re-runs)
-CREATE DATABASE IF NOT EXISTS payment_orchestrator
-    CHARACTER SET utf8mb4
-    COLLATE utf8mb4_unicode_ci;
+CREATE DATABASE IF NOT EXISTS payment_orchestrator;
 
 USE payment_orchestrator;
 

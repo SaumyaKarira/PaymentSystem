@@ -1,28 +1,25 @@
 # Payment Orchestration System
 
-A production-grade, event-driven **Payment Orchestration System** built with **Java 21** and **Spring Boot 3.x**. It demonstrates a clean layered architecture with synchronous REST APIs, idempotency via Redis, smart provider routing, and a fully automated non-blocking Kafka retry pipeline with Dead Letter Queue (DLQ) handling.
+A event-driven **Payment Orchestration System** built with **Java 21** and **Spring Boot 3.x**. It demonstrates a clean layered architecture with synchronous REST APIs, idempotency via Redis, smart provider routing, and a fully automated non-blocking Kafka retry pipeline with Dead Letter Queue (DLQ) handling.
 
 ---
 
 ## Table of Contents
 
 - [What This Project Does](#what-this-project-does)
-- [Architecture Overview](#architecture-overview)
 - [Technology Stack](#technology-stack)
 - [Project Structure](#project-structure)
-- [Prerequisites](#prerequisites)
-- [Initial Setup](#initial-setup)
-  - [1. MySQL Setup](#1-mysql-setup)
-  - [2. Redis Setup](#2-redis-setup)
-  - [3. Apache Kafka Setup](#3-apache-kafka-setup)
-- [Running the Application](#running-the-application)
+- [Infrastructure Setup (Localhost)](#infrastructure-setup-localhost)
+- [Execution & Quick-Start Guide](#execution--quick-start-guide)
+- [Testing Idempotency & Payment Routing](#testing-idempotency--payment-routing)
+- [System Architecture Blueprint](#system-architecture-blueprint)
 - [API Reference](#api-reference)
-  - [Create Payment](#create-payment)
-  - [Get Payment](#get-payment)
+   - [Create Payment](#create-payment)
+   - [Get Payment](#get-payment)
 - [Payment Lifecycle & State Machine](#payment-lifecycle--state-machine)
 - [Idempotency Behaviour](#idempotency-behaviour)
 - [Kafka Retry & DLQ Architecture](#kafka-retry--dlq-architecture)
-- [Provider Failover Strategy](#provider-failover-strategy)
+- [Provider Routing & Retry Strategy](#provider-routing--retry-strategy)
 - [Concurrency & Optimistic Locking](#concurrency--optimistic-locking)
 - [Running Tests](#running-tests)
 - [Sample cURL Commands](#sample-curl-commands)
@@ -37,53 +34,151 @@ The Payment Orchestration System acts as a **payment gateway router and retry en
 1. **Idempotency** is enforced — duplicate requests within 24 hours are safely detected via Redis and return the original response without creating a duplicate charge.
 2. The payment is **persisted** to MySQL in an `INITIATED` state.
 3. A **Smart Routing Engine** selects the correct payment provider based on the payment method:
-   - `CARD` payments → **Provider A**
-   - `UPI` payments → **Provider B**
+   - `CARD` payments → **Provider A** (primary)
+   - `UPI` payments → **Provider B** (primary)
 4. If the provider **succeeds** → payment is marked `SUCCESS` and the client gets a `201 Created` response.
 5. If the provider **fails** (simulated 20% failure rate — 504 Gateway Timeout or 500 Internal Error):
    - Payment is transitioned to `PROCESSING`
    - A `PaymentEvent` is published to **Apache Kafka** (`payment-main-topic`)
    - The client immediately receives a `201` with `PROCESSING` status (non-blocking)
 6. The **Kafka Retry Consumer** (`@RetryableTopic`) retries with **exponential backoff** (2s → 4s → 8s) across automatically generated retry topics.
-7. On retries, a **provider failover** occurs — if Provider A failed for CARD, retries use Provider B.
+7. All retry attempts use the **same primary provider** that was selected initially (no provider failover — this is by design).
 8. If all retries are exhausted, the message lands on the **Dead Letter Topic** (`payment-main-topic-dlt`) and the payment is marked `FAILED`.
 9. Throughout all of this, **Optimistic Locking** (`@Version` on the JPA entity) prevents race conditions and dirty writes between concurrent HTTP threads and Kafka consumer threads.
 
 ---
 
-## Architecture Overview
+## System Architecture Blueprint
+
+The Payment Orchestration System uses a clean **layered architecture** with two distinct payment processing paths: **Synchronous REST** (happy path) and **Asynchronous Kafka Retry** (resilience path).
+
+### Layered Architecture Overview
 
 ```
-Client
-  │
-  ▼
-┌─────────────────────────────────────────────────────────┐
-│  Spring Boot Application (localhost:8080)               │
-│                                                         │
-│  IdempotencyFilter  (Servlet Filter)                    │
-│       │  checks Redis before any controller logic       │
-│       ▼                                                 │
-│  PaymentController  (REST Layer)                        │
-│       │  POST /v1/payments  │  GET /v1/payments/{id}    │
-│       ▼                                                 │
-│  PaymentOrchestratorService  (Core Business Logic)      │
-│       │                                                 │
-│       ├── IdempotencyService  ──► Redis (localhost:6379)│
-│       ├── PaymentRepository   ──► MySQL (localhost:3306)│
-│       ├── RoutingEngine                                 │
-│       │       ├── ProviderAConnector (CARD primary)     │
-│       │       └── ProviderBConnector (UPI primary)      │
-│       └── KafkaTemplate ──► Kafka (localhost:9092)      │
-│                               │                         │
-│                               ▼                         │
-│  PaymentRetryConsumer  (@RetryableTopic)                │
-│       ├── payment-main-topic        (attempt 1)         │
-│       ├── payment-main-topic-retry-0 (attempt 2, +2s)  │
-│       ├── payment-main-topic-retry-1 (attempt 3, +4s)  │
-│       ├── payment-main-topic-retry-2 (attempt 4, +8s)  │
-│       └── payment-main-topic-dlt    (mark FAILED)       │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Presentation Layer (HTTP)                                      │
+│  • IdempotencyFilter (Servlet filter)                           │
+│  • PaymentController (REST endpoints: POST /v1/payments, GET /{id})
+└─────────────────────────────────────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Application/Service Layer (Business Logic)                     │
+│  • PaymentOrchestratorService (orchestration)                   │
+│  • IdempotencyService (Redis lock & cache)                      │
+│  • RoutingEngine (provider selection)                           │
+└─────────────────────────────────────────────────────────────────┘
+         │                            │                    │
+         ▼                            ▼                    ▼
+    ┌────────┐          ┌──────────────────────┐     ┌──────────┐
+    │  MySQL │          │  Redis Cache         │     │  Kafka   │
+    │        │          │  (Idempotency TTL)   │     │  Topics  │
+    │payments│          │  localhost:6379      │     │:9092     │
+    │table   │          │  (24-hour TTL)       │     │          │
+    │:3306   │          └──────────────────────┘     └──────────┘
+    └────────┘                                              │
+                                                           ▼
+                                      ┌─────────────────────────────┐
+                                      │  PaymentRetryConsumer       │
+                                      │  • @RetryableTopic          │
+                                      │  • Non-blocking retry       │
+                                      │  • Exponential backoff      │
+                                      │  • DLT handler              │
+                                      └─────────────────────────────┘
+                                              │
+                                              ▼
+                        ┌─────────────────────────────────┐
+                        │  Provider Connectors            │
+                        │  • ProviderAConnector (CARD)    │
+                        │  • ProviderBConnector (UPI)     │
+                        └─────────────────────────────────┘
 ```
+
+### Synchronous REST Path (Happy Path, ~80% of payments)
+
+When a client calls `POST /v1/payments` and the primary provider succeeds:
+
+```
+1. Client request
+   ↓
+2. IdempotencyFilter checks Redis for duplicate/in-flight key
+   ↓
+3. PaymentController validates header & body (@Valid)
+   ↓
+4. PaymentOrchestratorService:
+   a. Acquires Redis in-flight lock
+   b. Inserts payment row in MySQL 
+   c. Calls primary provider connector (CARD→A, UPI→B)
+   ↓
+5. Provider returns transaction reference (success)
+   ↓
+6. Service updates MySQL: status=SUCCESS, provider_id, provider_reference_id
+   ↓
+7. Service caches response in Redis (24-hour TTL)
+   ↓
+8. Client receives HTTP 201 with PaymentResponse (status=SUCCESS)
+```
+
+**Total latency:** ~100-500ms (depends on provider HTTP call; no Kafka involved).
+
+### Asynchronous Kafka Retry Path (Resilience Path, ~20% of payments)
+
+When a client calls `POST /v1/payments` and the primary provider fails:
+
+```
+HTTP Request Phase:
+─────────────────
+1. Client request
+   ↓
+2-3. Idempotency + validation (same as happy path)
+   ↓
+4-5. Service acquires lock, inserts payment (status=INITIATED)
+   ↓
+6. Service calls provider → THROWS ProviderException (504/500 simulated failure)
+   ↓
+7. Service catches exception, updates MySQL (status=PROCESSING, retryCount=0)
+   ↓
+8. Service publishes PaymentEvent to Kafka topic (non-blocking)
+   ↓
+9. Service caches PROCESSING response in Redis
+   ↓
+10. Client receives HTTP 201 with PaymentResponse (status=PROCESSING) — request thread released
+
+Async Kafka Retry Phase (separate thread):
+───────────────────────────────────────────
+11. PaymentRetryConsumer receives message on payment-main-topic
+    ↓
+12. Service routes to primary provider (CARD→A, UPI→B)
+    ↓
+13. Provider call:
+    • SUCCESS → update MySQL (status=SUCCESS), commit Kafka offset, done
+    • FAILURE → update MySQL (retryCount++), throw exception
+             → Spring Kafka moves message to payment-main-topic-retry-0
+             → Partition pauses for 2 seconds (non-blocking backoff)
+    ↓
+14. Exponential backoff: 2s → 4s → 8s between retry attempts
+    ↓
+15. After 4 total attempts (1 initial + 3 retries):
+    • If any succeeds → status=SUCCESS, done
+    • If all fail → message goes to payment-main-topic-dlt (Dead Letter Topic)
+    ↓
+16. DLT Handler fires:
+    • Updates MySQL (status=FAILED)
+    • Logs error for operational investigation
+```
+
+**Why two paths?**
+- **Sync path** delivers feedback immediately for happy cases (fast, simple).
+- **Async path** provides resilience: provider downtime doesn't block the HTTP response; retries happen in the background over minutes, not milliseconds.
+- Client can poll `GET /v1/payments/{id}` anytime to check the current status.
+
+### Key Infrastructure & Data Flow
+
+| Component | Type | Role | Config |
+|-----------|------|------|--------|
+| **MySQL** | Persistent store | Single source of truth for payment state | `localhost:3306/payment_orchestrator` |
+| **Redis** | Cache & Lock | Idempotency key storage + in-flight lock | `localhost:6379` (24-hour TTL) |
+| **Kafka** | Message queue | Async retry pipeline | `localhost:9092` |
+| **Primary Provider** | External service | CARD→ProviderA, UPI→ProviderB | Simulated with 20% failure rate |
 
 ---
 
@@ -112,7 +207,7 @@ PaymentSystem/
 └── src/
     ├── main/
     │   ├── java/org/example/
-    │   │   ├── Main.java                         # Spring Boot entry point
+    │   │   ├── PaymentOrchestrationApplication.java                         # Spring Boot entry point
     │   │   ├── config/
     │   │   │   ├── RedisConfig.java              # Lettuce Redis configuration
     │   │   │   ├── KafkaProducerConfig.java      # Kafka producer beans
@@ -163,51 +258,21 @@ PaymentSystem/
 
 ---
 
-## Prerequisites
+## Infrastructure Setup (Localhost)
 
-Make sure the following are installed on your local machine before running the application.
+This Payment Orchestration System requires four backing services running locally: **Java 21**, **MySQL 8.x**, **Redis 7.x**, and **Apache Kafka 3.x**. Install and start them using Homebrew (macOS).
 
-| Tool        | Install Command (macOS/Homebrew)          | Verify                  |
-|-------------|-------------------------------------------|-------------------------|
-| Java 21     | `brew install openjdk@21`                 | `java -version`         |
-| Maven 3.8+  | `brew install maven`                      | `mvn -version`          |
-| MySQL 8.x   | `brew install mysql`                      | `mysql --version`       |
-| Redis 7.x   | `brew install redis`                      | `redis-server --version`|
-| Apache Kafka| `brew install kafka`                      | `kafka-topics.sh --version` |
+### Step 1: Install All Services via Homebrew
 
-> **Windows / Linux users:** Use the official download pages:
-> - Java 21: https://adoptium.net
-> - MySQL: https://dev.mysql.com/downloads/
-> - Redis: https://redis.io/download
-> - Kafka: https://kafka.apache.org/downloads
-
----
-
-## Initial Setup
-
-### 1. MySQL Setup
-
-#### Start MySQL
-```bash
-# macOS (Homebrew)
-brew services start mysql
-
-# Linux (systemd)
-sudo systemctl start mysql
-```
-
-#### Create the database and user
 ```bash
 # Connect as root
-mysql -u root -p
+mysql -u root
 ```
 
 Inside the MySQL shell:
 ```sql
 -- Create the database
-CREATE DATABASE IF NOT EXISTS payment_orchestrator
-    CHARACTER SET utf8mb4
-    COLLATE utf8mb4_unicode_ci;
+CREATE DATABASE IF NOT EXISTS payment_orchestrator;
 
 -- If your root user has no password set locally, run:
 ALTER USER 'root'@'localhost' IDENTIFIED BY 'password';
@@ -215,134 +280,175 @@ FLUSH PRIVILEGES;
 
 EXIT;
 ```
+After setting pasword use cmd to connect to mysql and enter password.
+```sql
+mysql -u root -p
+````
 
-> The application is pre-configured with:
-> - **Host:** `localhost:3306`
-> - **Database:** `payment_orchestrator`
-> - **Username:** `root`
-> - **Password:** `password`
->
-> To change these, edit `src/main/resources/application.yml` under `spring.datasource`.
+### Step 2: Start Each Service
 
-> **Schema creation is automatic.** On first startup, Spring Boot runs `src/main/resources/schema.sql` which creates the `payments` table with all indexes. You do **not** need to run it manually.
+Open four separate terminal windows or use terminal multiplexing (tmux/screen). Start each service:
 
----
-
-### 2. Redis Setup
-
-#### Start Redis
 ```bash
-# macOS (Homebrew)
+# Terminal 1 — Start MySQL
+brew services start mysql
+
+# Terminal 2 — Start Redis
 brew services start redis
 
-# Linux (systemd)
-sudo systemctl start redis
-
-# Or start manually in the foreground:
-redis-server
-```
-
-#### Verify Redis is running
-```bash
-redis-cli ping
-# Expected output: PONG
-```
-
-> The application connects to Redis at `localhost:6379` with no password (standard local default).
-> No additional Redis configuration is required.
-
----
-
-### 3. Apache Kafka Setup
-
-#### Option A — Homebrew (macOS, easiest)
-```bash
-# Install
-brew install kafka
-
-# Start ZooKeeper first
+# Terminal 3 — Start ZooKeeper (required by Kafka)
 brew services start zookeeper
 
-# Then start Kafka broker
+# Terminal 4 — Start Kafka broker
 brew services start kafka
-
-# Verify both are running
-brew services list | grep -E "kafka|zookeeper"
 ```
 
-#### Option B — Manual (all platforms)
+### Step 3: Verify All Services Are Running
+
+In a new terminal, run these diagnostic checks:
+
 ```bash
-# Navigate to your Kafka installation directory
-cd /path/to/kafka
+# Check Java 21
+java -version
+# Expected: openjdk version "21.x.x" ...
 
-# Terminal 1 — Start ZooKeeper
-bin/zookeeper-server-start.sh config/zookeeper.properties
+# Check MySQL
+mysql -u root -e "SELECT 1;"
+# Expected: 1 (with no output errors)
 
-# Terminal 2 — Start Kafka broker
-bin/kafka-server-start.sh config/server.properties
-```
+# Check Redis
+redis-cli ping
+# Expected: PONG
 
-#### Verify Kafka is running
-```bash
-# List topics (should return empty or existing topics)
+# Check Kafka
 kafka-topics --list --bootstrap-server localhost:9092
+# Expected: (no error; topics list will be empty on first run)
 ```
 
-> The application uses Kafka at `localhost:9092`. Retry topics and the DLT are **auto-created** by `@RetryableTopic` on first message publish — no manual topic creation needed.
+If all four commands succeed, all backing services are alive and ready.
 
 ---
 
-## Running the Application
+## Execution & Quick-Start Guide
 
-### Step 1 — Clone / open the project
+### Build the Project
+
+Navigate to the project root and compile using Maven:
+
 ```bash
 cd /path/to/PaymentSystem
+
+# Clean build with tests
+mvn clean install -U
+
+# Or skip tests for a faster build (tests require running infrastructure)
+mvn clean install -U -DskipTests
 ```
 
-### Step 2 — Build the project
-```bash
-mvn clean install -DskipTests
-```
 
-### Step 3 — Start the application
+To change credentials, edit `src/main/resources/application.yml` under `spring.datasource`.
+
+### Start the Application
+
+Choose one method:
+
+**Method 1: Using Maven**
 ```bash
 mvn spring-boot:run
 ```
 
-Or run the fat JAR directly:
-```bash
-java -jar target/PaymentSystem-1.0-SNAPSHOT.jar
-```
-
-### Step 4 — Confirm the application started
-Look for this line in the logs:
+You should see:
 ```
 Started Main in X.XXX seconds (process running for X.XXX)
+Application ready to accept requests
 ```
 
-The application is now live at:
+## Testing Idempotency & Payment Routing
+
+### Test 1: Create a Fresh Payment (New Idempotency-Key)
+
+```bash
+curl -X POST http://localhost:8080/v1/payments \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: test-key-$(date +%s)" \
+  -d '{
+    "amount": 100.00,
+    "currency": "USD",
+    "paymentMethod": "CARD"
+  }'
 ```
-http://localhost:8080
+
+**Expected response (HTTP 201):**
+```json
+{
+   "id": "550e8400-e29b-41d4-a716-446655440000",
+   "idempotencyKey": "test-key-1234567890",
+   "amount": 100.00,
+   "currency": "USD",
+   "paymentMethod": "CARD",
+   "status": "SUCCESS",
+   "providerId": "PROVIDER_A",
+   "providerReferenceId": "PROVA-A1B2C3D4E5F6G7H8",
+   "retryCount": 0,
+   "createdAt": "2026-05-27T10:30:00",
+   "updatedAt": "2026-05-27T10:30:00.123"
+}
 ```
 
-### Startup Checklist
+**Note:** The `status` will be `SUCCESS` ~80% of the time (synchronous success), or `PROCESSING` ~20% of the time (triggering Kafka retry pipeline).
 
-Before starting, confirm all three backing services are up:
+### Test 2: Idempotency Cache Hit (Same Key, Second Request)
 
-| Service   | Check Command                          | Expected        |
-|-----------|----------------------------------------|-----------------|
-| MySQL     | `mysql -u root -ppassword -e "SELECT 1"`| `1`            |
-| Redis     | `redis-cli ping`                        | `PONG`         |
-| Kafka     | `kafka-topics --list --bootstrap-server localhost:9092` | (no error) |
+Use the same `Idempotency-Key` from Test 1:
 
----
-
-## API Reference
-
-### Base URL
+```bash
+curl -X POST http://localhost:8080/v1/payments \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: test-key-1234567890" \
+  -d '{
+    "amount": 100.00,
+    "currency": "USD",
+    "paymentMethod": "CARD"
+  }'
 ```
-http://localhost:8080
+
+**Expected response (HTTP 201):**
+- Same exact response as Test 1
+- **No new payment created in MySQL**
+- No provider call executed
+- Response served from Redis cache (instant)
+
+### Test 3: Verify Database Routing Entries
+
+Connect to MySQL and inspect the payment records:
+
+```bash
+mysql -u root -ppassword payment_orchestrator
+
+SELECT 
+  id, 
+  LEFT(idempotency_key, 20) AS idem_key, 
+  amount, 
+  currency,
+  payment_method, 
+  status, 
+  provider_id,
+  LEFT(provider_reference_id, 20) AS prov_ref,
+  retry_count, 
+  version, 
+  created_at
+FROM payments
+ORDER BY created_at DESC
+LIMIT 20;
 ```
+
+**Key columns to verify:**
+- **payment_method:** `CARD` or `UPI`
+- **provider_id:** `PROVIDER_A` (primary for CARD) or `PROVIDER_B` (primary for UPI)
+- **status:** `SUCCESS`, `PROCESSING`, or `FAILED`
+- **retry_count:** Number of Kafka delivery attempts (0 if synchronous success, 1+ if retried)
+- **version:** Incremented on each DB write (optimistic locking counter)
+
 
 ---
 
@@ -363,9 +469,9 @@ Creates a new payment. This endpoint is **idempotent** — identical requests wi
 
 ```json
 {
-  "amount": 150.00,
-  "currency": "USD",
-  "paymentMethod": "CARD"
+   "amount": 150.00,
+   "currency": "USD",
+   "paymentMethod": "CARD"
 }
 ```
 
@@ -375,25 +481,6 @@ Creates a new payment. This endpoint is **idempotent** — identical requests wi
 | `currency`      | String     | Yes      | 2–10 characters (ISO 4217 code)      |
 | `paymentMethod` | Enum       | Yes      | `CARD` or `UPI`                      |
 
-#### Response — `201 Created`
-
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "idempotencyKey": "my-unique-key-001",
-  "amount": 150.00,
-  "currency": "USD",
-  "paymentMethod": "CARD",
-  "status": "SUCCESS",
-  "providerId": "PROVIDER_A",
-  "providerReferenceId": "PROVA-A1B2C3D4E5F6G7H8",
-  "retryCount": 0,
-  "createdAt": "2026-05-27T10:30:00",
-  "updatedAt": "2026-05-27T10:30:00.123"
-}
-```
-
-> If the provider fails (20% chance), `status` will be `PROCESSING` and `providerReferenceId` will be `null`. Poll `GET /v1/payments/{id}` to track the outcome.
 
 #### Error Responses
 
@@ -417,21 +504,21 @@ Fetches the real-time status of a payment directly from MySQL. Always returns th
 |-----------|------------------------------------|
 | `id`      | The UUID of the payment to fetch   |
 
-#### Response — `200 OK`
+#### Response — `201 OK`
 
 ```json
 {
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "idempotencyKey": "my-unique-key-001",
-  "amount": 150.00,
-  "currency": "USD",
-  "paymentMethod": "CARD",
-  "status": "PROCESSING",
-  "providerId": "PROVIDER_A",
-  "providerReferenceId": null,
-  "retryCount": 2,
-  "createdAt": "2026-05-27T10:30:00",
-  "updatedAt": "2026-05-27T10:30:08"
+   "id": "550e8400-e29b-41d4-a716-446655440000",
+   "idempotencyKey": "my-unique-key-001",
+   "amount": 150.00,
+   "currency": "USD",
+   "paymentMethod": "CARD",
+   "status": "PROCESSING",
+   "providerId": "PROVIDER_A",
+   "providerReferenceId": null,
+   "retryCount": 2,
+   "createdAt": "2026-05-27T10:30:00",
+   "updatedAt": "2026-05-27T10:30:08"
 }
 ```
 
@@ -484,7 +571,7 @@ Every `POST /v1/payments` request **must** include a unique `Idempotency-Key` he
 |----------|-------------|
 | **New key** | Request proceeds normally through the full processing pipeline |
 | **Duplicate key, in-flight** | Returns `409 Conflict` immediately — the original request is still being processed |
-| **Duplicate key, completed** | Returns `200 OK` with the **exact same response** as the original — without touching the database or any provider |
+| **Duplicate key, completed** | Returns `201 OK` with the **exact same response** as the original — without touching the database or any provider |
 
 **How it works internally:**
 1. The `IdempotencyFilter` runs before the controller
@@ -526,184 +613,64 @@ kafka-console-consumer \
 
 ---
 
-## Provider Failover Strategy
+## Provider Routing & Retry Strategy
 
-| Attempt | Payment Method | Provider Used     |
-|---------|---------------|-------------------|
-| 1       | CARD          | Provider A (primary) |
-| 2+      | CARD          | Provider B (failover) |
-| 1       | UPI           | Provider B (primary) |
-| 2+      | UPI           | Provider A (failover) |
+### Primary Provider Selection
 
-Both providers have a simulated **20% failure rate** (random 504 / 500 errors) to exercise the retry and failover paths. This rate is controlled by `FAILURE_RATE = 0.20` in `ProviderAConnector` and `ProviderBConnector`.
+The `RoutingEngine` selects the primary provider based solely on payment method:
+
+| Payment Method | Primary Provider | Details |
+|---|---|---|
+| `CARD` | Provider A | Used for all CARD payment attempts (sync + all Kafka retries) |
+| `UPI` | Provider B | Used for all UPI payment attempts (sync + all Kafka retries) |
+
+
+### Simulated Failure Rate
+
+Both providers intentionally simulate a **20% failure rate** to exercise the retry and idempotency paths during local development. Failures are random.
+This is controlled by `FAILURE_RATE = 0.20` in `AbstractSimulatedProviderConnector` (parent class of both providers).
+
+### Retry Mechanism
+
+When a provider fails:
+
+1. **Sync attempt fails** (HTTP 504/500 thrown during `POST /v1/payments`)
+   → Payment transitioned to `PROCESSING` status
+   → Event published to Kafka
+   → Client receives `HTTP 201 PROCESSING` immediately
+
+2. **Kafka retry attempts** (up to 4 total deliveries)
+   → Same primary provider is called again
+   → Exponential backoff: 2s, 4s, 8s between attempts
+   → Non-blocking: partition pauses, other messages proceed
+   → If SUCCESS on any attempt: payment marked `SUCCESS`
+   → If all 4 attempts fail: message lands on DLT, payment marked `FAILED`
+
+**Timeline example for a failing CARD payment:**
+```
+T=0ms     — POST /v1/payments (sync attempt) → Provider A fails
+T=0ms     — Kafka event published, HTTP 201 PROCESSING returned
+T=2s      — Kafka attempt #2 on retry-0 topic → Provider A fails again
+T=6s      — Kafka attempt #3 on retry-1 topic → Provider A fails again
+T=14s     — Kafka attempt #4 on retry-2 topic → Provider A fails again
+T=14s     — DLT handler fires → payment marked FAILED
+```
+
+All attempts target the same provider (ProviderA for CARD, ProviderB for UPI).
 
 ---
 
-## Concurrency & Optimistic Locking
 
-The `Payment` entity has a `@Version` field (mapped to the `version` column in MySQL). Every database UPDATE includes:
 
-```sql
-UPDATE payments
-SET status = ?, version = version + 1, ...
-WHERE id = ? AND version = <expected>
-```
 
-If two threads (e.g., a REST request and a Kafka consumer) both read version `N` and both try to update:
-- **Thread A** commits → version becomes `N+1`
-- **Thread B** tries with `WHERE version = N` → 0 rows affected → Hibernate throws `ObjectOptimisticLockingFailureException`
-- The service catches this and logs a warning — the concurrent update wins, preventing any silent overwrite
-
----
-
-## Running Tests
-
-```bash
-# Run all tests
-mvn test
-
-# Run only the unit tests (fast — no infrastructure needed)
-mvn test -Dtest=PaymentOrchestratorServiceTest
-
-# Run only the web layer slice tests (fast — no infrastructure needed)
-mvn test -Dtest=IdempotencyFilterTest
-
-# Run only the Kafka integration tests (uses embedded Kafka — takes ~45–90 seconds)
-mvn test -Dtest=PaymentConsumerIntegrationTest
-
-# Run all tests with verbose output
-mvn test -Dsurefire.useFile=false
-```
 
 ### Test Coverage Summary
 
 | Test File | Type | Tests | What It Validates |
 |-----------|------|-------|-------------------|
 | `PaymentOrchestratorServiceTest` | Mockito Unit | 11 | Routing logic, sync/async state transitions, Kafka hand-off, DLT handler, optimistic lock warnings |
-| `IdempotencyFilterTest` | `@WebMvcTest` Slice | 10 | Filter HTTP short-circuits (400/409), cache hits (200), Bean Validation, GlobalExceptionHandler (404) |
+| `IdempotencyFilterTest` | `@WebMvcTest` Slice | 10 | Filter HTTP short-circuits (400/409), cache hits (201), Bean Validation, GlobalExceptionHandler (404) |
 | `PaymentConsumerIntegrationTest` | `@EmbeddedKafka` Integration | 5 | Full Kafka retry lifecycle, failover routing, DLT terminal state, idempotent skip of terminal payments |
-
----
-
-## Sample cURL Commands
-
-### Create a CARD payment
-```bash
-curl -X POST http://localhost:8080/v1/payments \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: $(uuidgen)" \
-  -d '{"amount": 150.00, "currency": "USD", "paymentMethod": "CARD"}'
-```
-
-### Create a UPI payment
-```bash
-curl -X POST http://localhost:8080/v1/payments \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: $(uuidgen)" \
-  -d '{"amount": 500.00, "currency": "INR", "paymentMethod": "UPI"}'
-```
-
-### Fetch payment status
-```bash
-curl http://localhost:8080/v1/payments/{replace-with-payment-id}
-```
-
-### Test idempotency replay (run the same key twice)
-```bash
-KEY="my-fixed-key-$(date +%s)"
-
-# First call — creates the payment
-curl -X POST http://localhost:8080/v1/payments \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: $KEY" \
-  -d '{"amount": 99.99, "currency": "USD", "paymentMethod": "CARD"}'
-
-# Second call — returns the cached response (HTTP 200, no new payment)
-curl -X POST http://localhost:8080/v1/payments \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: $KEY" \
-  -d '{"amount": 99.99, "currency": "USD", "paymentMethod": "CARD"}'
-```
-
-### Test 400 — missing Idempotency-Key header
-```bash
-curl -X POST http://localhost:8080/v1/payments \
-  -H "Content-Type: application/json" \
-  -d '{"amount": 100.00, "currency": "USD", "paymentMethod": "CARD"}'
-```
-
-### Test 404 — unknown payment ID
-```bash
-curl http://localhost:8080/v1/payments/00000000-0000-0000-0000-000000000000
-```
-
----
-
-## Monitoring & Debugging
-
-### Check Redis Idempotency Keys
-```bash
-# Open Redis CLI
-redis-cli
-
-# List all idempotency keys
-KEYS idempotency:*
-
-# Inspect a key's value
-GET "idempotency:your-key-here"
-
-# Check remaining TTL (in seconds)
-TTL "idempotency:your-key-here"
-```
-
-### Inspect MySQL Records
-```bash
-mysql -u root -ppassword payment_orchestrator
-
-SELECT id, left(idempotency_key, 20) AS idem_key, amount, currency,
-       payment_method, status, provider_id,
-       left(provider_reference_id, 20) AS prov_ref,
-       retry_count, version, created_at
-FROM payments
-ORDER BY created_at DESC
-LIMIT 20;
-```
-
-### Watch Application Logs
-The application logs at `DEBUG` level for `org.example` classes. Key log patterns to watch:
-
-| Log Pattern | Meaning |
-|-------------|---------|
-| `Payment [xxx] created in INITIATED state` | New payment successfully persisted |
-| `Simulated 504 Gateway Timeout` | Provider failure triggered (retry will follow) |
-| `Payment [xxx] published to Kafka topic` | Async retry pipeline activated |
-| `Kafka retry consumer: processing payment ... attempt #2` | First Kafka retry in progress |
-| `Payment [xxx] succeeded on retry attempt` | Kafka retry resolved the payment |
-| `DLT HANDLER: Payment [xxx] has exhausted all retry attempts` | All retries failed, payment marked FAILED |
-| `Optimistic lock conflict` | Concurrent thread detected — safe, handled gracefully |
-
-### Kafka Topic Inspection
-```bash
-# Watch the main topic in real time
-kafka-console-consumer \
-  --bootstrap-server localhost:9092 \
-  --topic payment-main-topic \
-  --from-beginning
-
-# Watch the DLT for failed payments
-kafka-console-consumer \
-  --bootstrap-server localhost:9092 \
-  --topic payment-main-topic-dlt \
-  --from-beginning
-
-# Check consumer group lag
-kafka-consumer-groups \
-  --bootstrap-server localhost:9092 \
-  --describe \
-  --group payment-retry-group
-```
-
----
 
 ## Configuration Reference
 
@@ -720,4 +687,3 @@ All configuration is in `src/main/resources/application.yml`. Key properties:
 | `payment.idempotency.ttl-seconds` | `86400` | Redis key TTL (24 hours) |
 | `payment.kafka.main-topic` | `payment-main-topic` | Main Kafka topic name |
 | `server.port` | `8080` | HTTP server port |
-

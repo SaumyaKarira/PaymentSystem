@@ -135,7 +135,7 @@ class PaymentRetryConsumerTest {
         }
 
         @Test
-        @DisplayName("deliveryAttempt header absent (null) defaults to 1 for first delivery")
+        @DisplayName("DeliveryAttempt header absent (null) defaults to 1 for first delivery")
         void nullDeliveryAttempt_defaultsToValue1() {
             Payment payment = processingPayment(0, 0L);
             when(paymentRepository.findById(PAYMENT_ID)).thenReturn(Optional.of(payment));

@@ -153,11 +153,11 @@ class PaymentOrchestratorServiceTest {
     class HappyPathTests {
 
         /**
-         * TC-01: CARD payment → ProviderA succeeds → MySQL SUCCESS → 201
+         * CARD payment → ProviderA succeeds → MySQL SUCCESS → 201
          */
         @Test
-        @DisplayName("TC-01: CARD routes to ProviderA, succeeds, returns SUCCESS response")
-        void tc01_cardPaymentSuccessViaProviderA() {
+        @DisplayName("CARD routes to ProviderA, succeeds, returns SUCCESS response")
+        void cardPaymentSuccessViaProviderA() {
             Payment saved    = savedInitiatedPayment(PaymentMethod.CARD);
             Payment success  = successPayment(PaymentMethod.CARD, PROVIDER_A_ID, PROVIDER_A_REF);
 
@@ -191,11 +191,11 @@ class PaymentOrchestratorServiceTest {
         }
 
         /**
-         * TC-02: UPI payment → ProviderB succeeds → ProviderA never called
+         * UPI payment → ProviderB succeeds → ProviderA never called
          */
         @Test
-        @DisplayName("TC-02: UPI routes to ProviderB, succeeds, ProviderA never called")
-        void tc02_upiPaymentSuccessViaProviderB() {
+        @DisplayName("UPI routes to ProviderB, succeeds, ProviderA never called")
+        void upiPaymentSuccessViaProviderB() {
             Payment saved   = savedInitiatedPayment(PaymentMethod.UPI);
             Payment success = successPayment(PaymentMethod.UPI, PROVIDER_B_ID, PROVIDER_B_REF);
 
@@ -220,11 +220,11 @@ class PaymentOrchestratorServiceTest {
         }
 
         /**
-         * TC-03: GET payment fetches real-time MySQL state
+         * GET payment fetches real-time MySQL state
          */
         @Test
-        @DisplayName("TC-03: GET payment returns real-time status, retryCount, version from MySQL")
-        void tc03_getPaymentFetchesRealTimeState() {
+        @DisplayName("GET payment returns real-time status, retryCount, version from MySQL")
+        void getPaymentFetchesRealTimeState() {
             Payment processing = Payment.builder()
                     .id(PAYMENT_ID).idempotencyKey(IDEMPOTENCY_KEY)
                     .amount(new BigDecimal("150.00")).currency("USD")
@@ -246,11 +246,11 @@ class PaymentOrchestratorServiceTest {
         }
 
         /**
-         * TC-04: Duplicate request with completed key → returns cached response, zero processing
+         * Duplicate request with completed key → returns cached response, zero processing
          */
         @Test
-        @DisplayName("TC-04: Idempotency cache hit returns cached response without any DB/provider calls")
-        void tc04_idempotencyCacheHitBypassesAllLayers() {
+        @DisplayName("Idempotency cache hit returns cached response without any DB/provider calls")
+        void idempotencyCacheHitBypassesAllLayers() {
             PaymentResponse cached = new PaymentResponse(
                     PAYMENT_ID, IDEMPOTENCY_KEY, new BigDecimal("150.00"), "USD",
                     PaymentMethod.CARD, PaymentStatus.SUCCESS,
@@ -277,11 +277,11 @@ class PaymentOrchestratorServiceTest {
     class NegativeTests {
 
         /**
-         * TC-06: In-flight lock not acquired, no cached response → IdempotencyConflictException
+         * In-flight lock not acquired, no cached response → IdempotencyConflictException
          */
         @Test
-        @DisplayName("TC-06: In-flight key with no cached value throws IdempotencyConflictException")
-        void tc06_inFlightKeyThrowsConflict() {
+        @DisplayName("In-flight key with no cached value throws IdempotencyConflictException")
+        void inFlightKeyThrowsConflict() {
             when(idempotencyService.acquireInFlightLock(IDEMPOTENCY_KEY)).thenReturn(false);
             when(idempotencyService.getCachedResponse(IDEMPOTENCY_KEY)).thenReturn(Optional.empty());
 
@@ -294,11 +294,11 @@ class PaymentOrchestratorServiceTest {
         }
 
         /**
-         * TC-08: GET with non-existent ID throws PaymentNotFoundException
+         * GET with non-existent ID throws PaymentNotFoundException
          */
         @Test
         @DisplayName("TC-08: GET with unknown UUID throws PaymentNotFoundException")
-        void tc08_unknownIdThrowsNotFoundException() {
+        void unknownIdThrowsNotFoundException() {
             String unknownId = "00000000-0000-0000-0000-000000000000";
             when(paymentRepository.findById(unknownId)).thenReturn(Optional.empty());
 
@@ -308,11 +308,11 @@ class PaymentOrchestratorServiceTest {
         }
 
         /**
-         * TC-09: Redis outage propagates exception and releases key
+         * Redis outage propagates exception and releases key
          */
         @Test
-        @DisplayName("TC-09: Redis connection failure propagates exception without touching DB")
-        void tc09_redisOutagePropagatesException() {
+        @DisplayName("Redis connection failure propagates exception without touching DB")
+        void redisOutagePropagatesException() {
             when(idempotencyService.acquireInFlightLock(IDEMPOTENCY_KEY))
                     .thenThrow(new org.springframework.data.redis.RedisConnectionFailureException("Redis down"));
 
@@ -332,12 +332,12 @@ class PaymentOrchestratorServiceTest {
     class ResiliencyTests {
 
         /**
-         * TC-10A: Provider throws 504 → status transitions to PROCESSING →
+         *  Provider throws 504 → status transitions to PROCESSING →
          * event published to Kafka → client receives PROCESSING response immediately
          */
         @Test
-        @DisplayName("TC-10A: Provider 504 → PROCESSING in MySQL → event on Kafka → 201 PROCESSING")
-        void tc10a_providerFailureTransitionsToProcessingAndPublishesToKafka() {
+        @DisplayName("Provider 504 → PROCESSING in MySQL → event on Kafka → 201 PROCESSING")
+        void providerFailureTransitionsToProcessingAndPublishesToKafka() {
             Payment saved       = savedInitiatedPayment(PaymentMethod.CARD);
             Payment processing  = processingPayment(PaymentMethod.CARD, PROVIDER_A_ID);
 
@@ -379,11 +379,11 @@ class PaymentOrchestratorServiceTest {
         }
 
         /**
-         * TC-DLT: DLT handler marks payment FAILED in MySQL after all retries exhausted
+         * DLT handler marks payment FAILED in MySQL after all retries exhausted
          */
         @Test
-        @DisplayName("TC-DLT: DLT handler marks payment as FAILED with correct version guard")
-        void tcDlt_dltHandlerMarksPaymentFailed() {
+        @DisplayName("DLT handler marks payment as FAILED with correct version guard")
+        void dltHandlerMarksPaymentFailed() {
             org.example.kafka.PaymentRetryConsumer retryConsumer =
                     new org.example.kafka.PaymentRetryConsumer(paymentRepository, routingEngine);
 

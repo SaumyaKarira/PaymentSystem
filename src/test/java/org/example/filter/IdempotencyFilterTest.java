@@ -164,7 +164,7 @@ class IdempotencyFilterTest {
          * → filterChain.doFilter() → controller.createPayment() → 201
          */
         @Test
-        @DisplayName("TC-01: Valid POST with new Idempotency-Key passes filter → HTTP 201 Created")
+        @DisplayName("Valid POST with new Idempotency-Key passes filter → HTTP 201 Created")
         void validPostPassesThroughFilter() throws Exception {
             when(idempotencyService.isInFlight(IDEMPOTENCY_KEY)).thenReturn(false);
             when(idempotencyService.getCachedResponse(IDEMPOTENCY_KEY)).thenReturn(Optional.empty());
@@ -191,7 +191,7 @@ class IdempotencyFilterTest {
          * No idempotency checks are performed.
          */
         @Test
-        @DisplayName("TC-02: GET requests bypass IdempotencyFilter — no idempotency checks performed")
+        @DisplayName("GET requests bypass IdempotencyFilter — no idempotency checks performed")
         void getRequestsBypassFilter() throws Exception {
             when(paymentOrchestratorService.getPayment(PAYMENT_ID))
                     .thenReturn(cachedSuccessResponse());
@@ -219,7 +219,7 @@ class IdempotencyFilterTest {
          * to the response and returns. The controller is never reached.
          */
         @Test
-        @DisplayName("TC-03A: Missing Idempotency-Key header → HTTP 400 Bad Request")
+        @DisplayName("Missing Idempotency-Key header → HTTP 400 Bad Request")
         void missingIdempotencyKeyHeader_returns400() throws Exception {
             mockMvc.perform(post(PAYMENTS_URL)
                             .contentType(MediaType.APPLICATION_JSON)
@@ -236,7 +236,7 @@ class IdempotencyFilterTest {
          * filter rejects with 400 before reaching the controller.
          */
         @Test
-        @DisplayName("TC-03B: Blank Idempotency-Key header → HTTP 400 Bad Request")
+        @DisplayName("Blank Idempotency-Key header → HTTP 400 Bad Request")
         void blankIdempotencyKeyHeader_returns400() throws Exception {
             mockMvc.perform(post(PAYMENTS_URL)
                             .header(IDEM_HEADER, "   ")
@@ -254,7 +254,7 @@ class IdempotencyFilterTest {
          * {@code GlobalExceptionHandler} returns 400 with a {@code fieldErrors} array.
          */
         @Test
-        @DisplayName("TC-03C: Negative amount fails Bean Validation → HTTP 400 with fieldErrors")
+        @DisplayName("Negative amount fails Bean Validation → HTTP 400 with fieldErrors")
         void negativeAmount_returns400WithFieldErrors() throws Exception {
             // Filter passes — stubs let request reach the controller
             when(idempotencyService.isInFlight("valid-key-bad-body")).thenReturn(false);
@@ -280,7 +280,7 @@ class IdempotencyFilterTest {
          * mapped to 400 by {@code GlobalExceptionHandler.handleMalformedBody()}.
          */
         @Test
-        @DisplayName("TC-03D: Invalid paymentMethod enum value → HTTP 400 Bad Request")
+        @DisplayName("Invalid paymentMethod enum value → HTTP 400 Bad Request")
         void invalidPaymentMethodEnum_returns400() throws Exception {
             when(idempotencyService.isInFlight("valid-key-enum-test")).thenReturn(false);
             when(idempotencyService.getCachedResponse("valid-key-enum-test")).thenReturn(Optional.empty());
@@ -304,7 +304,7 @@ class IdempotencyFilterTest {
          * The {@code fieldErrors} array must contain an entry for the {@code currency} field.
          */
         @Test
-        @DisplayName("TC-03E: Null currency fails Bean Validation → HTTP 400 with currency field error")
+        @DisplayName("Null currency fails Bean Validation → HTTP 400 with currency field error")
         void nullCurrency_returns400WithCurrencyFieldError() throws Exception {
             when(idempotencyService.isInFlight("valid-key-no-currency")).thenReturn(false);
             when(idempotencyService.getCachedResponse("valid-key-no-currency")).thenReturn(Optional.empty());
@@ -333,7 +333,7 @@ class IdempotencyFilterTest {
          * never invoked.
          */
         @Test
-        @DisplayName("TC-05: In-flight Idempotency-Key → HTTP 409 Conflict, controller not reached")
+        @DisplayName("In-flight Idempotency-Key → HTTP 409 Conflict, controller not reached")
         void inFlightKey_returns409Conflict() throws Exception {
             when(idempotencyService.isInFlight(IDEMPOTENCY_KEY)).thenReturn(true);
 
@@ -358,7 +358,7 @@ class IdempotencyFilterTest {
          * returns without calling {@code filterChain.doFilter()}.
          */
         @Test
-        @DisplayName("TC-04: Redis cache hit → HTTP 200 with cached body, controller bypassed")
+        @DisplayName("Redis cache hit → HTTP 200 with cached body, controller bypassed")
         void cacheHit_returns200WithCachedBody() throws Exception {
             when(idempotencyService.isInFlight(IDEMPOTENCY_KEY)).thenReturn(false);
             when(idempotencyService.getCachedResponse(IDEMPOTENCY_KEY))
@@ -401,7 +401,7 @@ class IdempotencyFilterTest {
          * {@link PaymentNotFoundException}, mapped to HTTP 404 with a structured JSON body.
          */
         @Test
-        @DisplayName("TC-08: GET with unknown payment ID → HTTP 404 structured response")
+        @DisplayName("GET with unknown payment ID → HTTP 404 structured response")
         void unknownPaymentId_returns404() throws Exception {
             String unknownId = "00000000-ffff-0000-ffff-000000000000";
             when(paymentOrchestratorService.getPayment(unknownId))
@@ -420,7 +420,7 @@ class IdempotencyFilterTest {
          * on the shared {@code ObjectMapper} used by the message converter.
          */
         @Test
-        @DisplayName("TC-09: Error response timestamp is an ISO-8601 string")
+        @DisplayName("Error response timestamp")
         void errorResponseTimestamp_isIso8601String() throws Exception {
             when(paymentOrchestratorService.getPayment(anyString()))
                     .thenThrow(new PaymentNotFoundException("any-id"));
