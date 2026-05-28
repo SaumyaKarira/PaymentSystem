@@ -265,11 +265,19 @@ public class GlobalExceptionHandler {
      * @return HTTP 404 with no body
      */
     @ExceptionHandler(NoResourceFoundException.class)
-    public ResponseEntity<Void> handleNoResourceFound(
+    public ResponseEntity<ErrorResponse> handleNoResourceFound(
             NoResourceFoundException ex, HttpServletRequest request) {
 
         log.debug("Static resource not found [{}]: {}", request.getRequestURI(), ex.getMessage());
-        return ResponseEntity.notFound().build();
+        ErrorResponse body = new ErrorResponse(
+                LocalDateTime.now(),
+                HttpStatus.NOT_FOUND.value(),
+                "Not Found",
+                ex.getMessage(),
+                request.getRequestURI(),
+                null
+        );
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(body);
     }
 
     /**
